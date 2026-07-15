@@ -141,12 +141,62 @@ impl MappedVia {
     }
 }
 
+/// Minimum length for a non-braced token to count as a rule-name match:
+/// prevents a rule with a short generic Name from matching stray text.
+const MIN_TOKEN_LEN: usize = 4;
+
+/// Candidate rule-identity tokens from a providerData text: brace-delimited
+/// spans ({GUID}-style InstanceIDs, any length) and maximal runs of
+/// identifier-ish characters (CoreNet-DNS-Out-UDP-style IDs, length-gated).
+/// Anchored token equality instead of substring `contains` — a rule named
+/// "e" must not swallow every filter — and it turns the O(filters × rules)
+/// scan into O(filters × tokens) hash lookups.
+fn candidate_tokens(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    // brace-delimited spans
+    let mut rest = text;
+    while let Some(open) = rest.find('{') {
+        if let Some(close) = rest[open..].find('}') {
+            out.push(&rest[open..open + close + 1]);
+            rest = &rest[open + close + 1..];
+        } else {
+            break;
+        }
+    }
+    // identifier runs
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.');
+    let mut start: Option<usize> = None;
+    for (i, c) in text.char_indices() {
+        match (is_ident(c), start) {
+            (true, None) => start = Some(i),
+            (false, Some(s)) => {
+                if i - s >= MIN_TOKEN_LEN {
+                    out.push(&text[s..i]);
+                }
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(s) = start {
+        if text.len() - s >= MIN_TOKEN_LEN {
+            out.push(&text[s..]);
+        }
+    }
+    out
+}
+
 /// Build filter_id -> (rule Name, how it was matched). Rules whose
 /// DisplayName is shared by several rules only match via providerData.
 pub fn build_filter_rule_map(
     filters: &[FilterInfo],
     rules: &[RuleInfo],
 ) -> HashMap<u64, (String, MappedVia)> {
+    // exact rule Name (InstanceID) lookup for providerData tokens
+    let by_name: HashMap<&str, &str> = rules
+        .iter()
+        .map(|r| (r.name.as_str(), r.name.as_str()))
+        .collect();
     // display name -> rule name, only when unambiguous
     let mut by_display: HashMap<&str, Option<&str>> = HashMap::new();
     for r in rules {
@@ -158,12 +208,12 @@ pub fn build_filter_rule_map(
 
     let mut map = HashMap::new();
     for f in filters {
-        // 1. providerData carrying the rule Name (InstanceID) verbatim
+        // 1. providerData token equal to a rule Name (InstanceID)
         let mut matched: Option<(String, MappedVia)> = None;
         if !f.provider_data_utf16.is_empty() {
-            for r in rules {
-                if f.provider_data_utf16.contains(r.name.as_str()) {
-                    matched = Some((r.name.clone(), MappedVia::ProviderData));
+            for token in candidate_tokens(&f.provider_data_utf16) {
+                if let Some(name) = by_name.get(token) {
+                    matched = Some((name.to_string(), MappedVia::ProviderData));
                     break;
                 }
             }
