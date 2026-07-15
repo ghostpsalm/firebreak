@@ -85,6 +85,24 @@ ConvertTo-Json -InputObject @($out) -Compress -Depth 3
     Ok(rules)
 }
 
+/// Cached rule set (JSON) for instant startup; refreshed each run. Lives
+/// alongside the DB under the ACL-protected data dir.
+fn rules_cache_path() -> PathBuf {
+    let base = std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into());
+    Path::new(&base).join("firebreak").join("rules-cache.json")
+}
+
+pub fn save_rules_cache(rules: &[RuleInfo]) {
+    if let Ok(json) = serde_json::to_string(rules) {
+        let _ = std::fs::write(rules_cache_path(), json);
+    }
+}
+
+pub fn load_rules_cache() -> Option<Vec<RuleInfo>> {
+    let json = std::fs::read_to_string(rules_cache_path()).ok()?;
+    serde_json::from_str(&json).ok()
+}
+
 /// Directory where backups land: %ProgramData%\firebreak\backups
 pub fn backup_dir() -> PathBuf {
     let base = std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into());

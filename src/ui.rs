@@ -66,7 +66,13 @@ impl Default for AuditContext {
 // ---- workers ----
 
 enum WorkerMsg {
+    /// audit state resolved — lets the header show it before the slower
+    /// rule enumeration finishes
+    AuditState(bool),
     Progress(String),
+    /// preliminary result from cached rules, shown instantly; a fresh
+    /// Ready follows once the live enumeration completes
+    Preliminary(Box<AnalysisResult>),
     NeedsEnable(Box<AnalysisResult>),
     Ready(Box<AnalysisResult>),
     Failed(String),
@@ -103,6 +109,13 @@ enum Sort {
     LastSeen,
 }
 
+#[derive(PartialEq, Clone, Copy)]
+pub(crate) enum DirFilter {
+    In,
+    Out,
+    All,
+}
+
 struct ApplyState {
     rx: Receiver<ApplyMsg>,
     total: usize,
@@ -128,6 +141,7 @@ pub struct App {
 
     // filters
     filter_text: String,
+    dir_filter: DirFilter,
     only_enabled: bool,
     only_zero_hit: bool,
     only_flagged: bool,
@@ -140,6 +154,7 @@ pub struct App {
     selected: Option<usize>,
     drawer_open: bool,
     tab: Tab,
+    audit_checked: bool,
 
     confirm_open: bool,
     apply: Option<ApplyState>,
@@ -158,6 +173,7 @@ impl App {
             worker_rx: None,
             progress: "Detecting audit state…".into(),
             filter_text: String::new(),
+            dir_filter: DirFilter::In, // audits start with inbound exposure
             only_enabled: true,
             only_zero_hit: false,
             only_flagged: false,
@@ -169,6 +185,7 @@ impl App {
             selected: None,
             drawer_open: false,
             tab: Tab::Sockets,
+            audit_checked: false,
             confirm_open: false,
             apply: None,
             status: String::new(),
@@ -182,6 +199,7 @@ impl App {
     }
 
     fn spawn_detect(&mut self, db_path: PathBuf, egui_ctx: egui::Context) {
+        self.audit_checked = false;
         let (tx, rx) = std::sync::mpsc::channel();
         self.worker_rx = Some(rx);
         std::thread::spawn(move || {
@@ -193,18 +211,38 @@ impl App {
                     ctx.request_repaint();
                 }
             };
-            let msg = match pipeline::audit_enabled() {
-                Ok(true) => match pipeline::analyze(&db_path, &progress) {
+            // audit state first — cheap, and lets the header settle before
+            // the slower rule enumeration
+            progress("Checking Windows audit policy…");
+            let enabled = match pipeline::audit_enabled() {
+                Ok(b) => b,
+                Err(e) => {
+                    let _ = tx.send(WorkerMsg::Failed(format!("{e:#}")));
+                    egui_ctx.request_repaint();
+                    return;
+                }
+            };
+            let _ = tx.send(WorkerMsg::AuditState(enabled));
+            egui_ctx.request_repaint();
+
+            if enabled {
+                // instant paint from cached rules while the live query runs
+                if let Some(prelim) = pipeline::quick_cached_result(&db_path) {
+                    let _ = tx.send(WorkerMsg::Preliminary(Box::new(prelim)));
+                    egui_ctx.request_repaint();
+                }
+                let msg = match pipeline::analyze(&db_path, &progress) {
                     Ok(r) => WorkerMsg::Ready(Box::new(r)),
                     Err(e) => WorkerMsg::Failed(format!("{e:#}")),
-                },
-                Ok(false) => match pipeline::rules_only(&progress) {
+                };
+                let _ = tx.send(msg);
+            } else {
+                let msg = match pipeline::rules_only(&progress) {
                     Ok(r) => WorkerMsg::NeedsEnable(Box::new(r)),
                     Err(e) => WorkerMsg::Failed(format!("{e:#}")),
-                },
-                Err(e) => WorkerMsg::Failed(format!("{e:#}")),
-            };
-            let _ = tx.send(msg);
+                };
+                let _ = tx.send(msg);
+            }
             egui_ctx.request_repaint();
         });
     }
@@ -222,6 +260,7 @@ impl App {
         app.unmatched = unmatched;
         app.listeners = listeners;
         app.drawer_open = true;
+        app.audit_checked = true;
         app.progress.clear();
         // preview-only state overrides for screenshotting non-default screens
         match std::env::var("FIREBREAK_PREVIEW_STATE").as_deref() {
@@ -271,17 +310,41 @@ impl App {
     }
 
     fn poll_worker(&mut self) {
-        let Some(rx) = &self.worker_rx else { return };
-        loop {
-            match rx.try_recv() {
-                Ok(WorkerMsg::Progress(s)) => self.progress = s,
-                Ok(WorkerMsg::NeedsEnable(r)) => {
+        // drain into a local buffer so message handlers can take &mut self
+        let mut msgs = Vec::new();
+        if let Some(rx) = &self.worker_rx {
+            loop {
+                match rx.try_recv() {
+                    Ok(m) => msgs.push(m),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        self.worker_rx = None;
+                        break;
+                    }
+                }
+            }
+        }
+        for m in msgs {
+            match m {
+                WorkerMsg::AuditState(b) => {
+                    self.ctx_info.auditing_active = b;
+                    self.audit_checked = true;
+                }
+                WorkerMsg::Progress(s) => self.progress = s,
+                WorkerMsg::Preliminary(r) => {
+                    // show cached rules immediately; phase stays Loading so
+                    // the header still signals a refresh is in flight
+                    self.absorb(*r);
+                    if !self.rows.is_empty() {
+                        self.drawer_open = true;
+                    }
+                }
+                WorkerMsg::NeedsEnable(r) => {
                     self.absorb(*r);
                     self.phase = Phase::NeedsEnable;
                     self.worker_rx = None;
-                    return;
                 }
-                Ok(WorkerMsg::Ready(r)) => {
+                WorkerMsg::Ready(r) => {
                     let ev = r.ctx.events_processed;
                     let un = r.ctx.unmatched_events;
                     self.absorb(*r);
@@ -289,9 +352,8 @@ impl App {
                     self.drawer_open = self.drawer_open || !self.rows.is_empty();
                     self.status = format!("Ingested {ev} events ({un} unattributed).");
                     self.worker_rx = None;
-                    return;
                 }
-                Ok(WorkerMsg::Failed(e)) => {
+                WorkerMsg::Failed(e) => {
                     self.phase = if self.phase == Phase::Enabling {
                         Phase::NeedsEnable
                     } else {
@@ -299,12 +361,6 @@ impl App {
                     };
                     self.status = format!("Error: {e}");
                     self.worker_rx = None;
-                    return;
-                }
-                Err(TryRecvError::Empty) => return,
-                Err(TryRecvError::Disconnected) => {
-                    self.worker_rx = None;
-                    return;
                 }
             }
         }
@@ -477,6 +533,11 @@ impl App {
         let mut idx: Vec<usize> = (0..self.rows.len())
             .filter(|&i| {
                 let r = &self.rows[i];
+                match self.dir_filter {
+                    DirFilter::In if !r.rule.direction.eq_ignore_ascii_case("inbound") => return false,
+                    DirFilter::Out if !r.rule.direction.eq_ignore_ascii_case("outbound") => return false,
+                    _ => {}
+                }
                 if self.only_enabled && !r.rule.is_enabled() {
                     return false;
                 }
@@ -535,8 +596,11 @@ impl eframe::App for App {
 fn native_options() -> eframe::NativeOptions {
     eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1420.0, 800.0])
-            .with_min_inner_size([980.0, 520.0]),
+            .with_inner_size([1460.0, 900.0])
+            .with_min_inner_size([1000.0, 620.0])
+            .with_decorations(false) // custom title bar (see paint::titlebar)
+            .with_resizable(true)
+            .with_title("firebreak"),
         ..Default::default()
     }
 }

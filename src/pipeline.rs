@@ -127,29 +127,99 @@ pub fn enable_collection(db_path: &Path, progress: &dyn Fn(&str)) -> Result<()> 
     Ok(())
 }
 
+/// Build the report rows from rules + aggregated usage + current listeners.
+/// Usage is looked up by exact InstanceID, else by the DisplayName+direction
+/// group key (profile variants share it).
+fn build_rows(
+    rules: Vec<crate::model::RuleInfo>,
+    all_usage: &std::collections::HashMap<String, RuleUsage>,
+    listener_list: &[Listener],
+) -> Vec<ui::RuleRow> {
+    rules
+        .into_iter()
+        .map(|rule| {
+            let usage = all_usage
+                .get(&rule.name)
+                .or_else(|| all_usage.get(&disp_key(&rule.display_name, &rule.direction)))
+                .cloned();
+            let flags = baseline_checks::flags_for(&rule);
+            let seen_apps: Vec<String> = usage
+                .as_ref()
+                .map(|u| {
+                    let mut names = BTreeSet::new();
+                    for (path, _hits) in u.apps.iter().take(8) {
+                        let ident = app_identity::identify(path);
+                        if ident.company.is_empty() {
+                            names.insert(ident.friendly_name);
+                        } else {
+                            names.insert(format!("{} ({})", ident.friendly_name, ident.company));
+                        }
+                    }
+                    names.into_iter().collect()
+                })
+                .unwrap_or_default();
+            let listening = listeners::listeners_for_rule(&rule, listener_list);
+            let target_enabled = rule.is_enabled();
+            ui::RuleRow { rule, usage, flags, seen_apps, listening, target_enabled }
+        })
+        .collect()
+}
+
+/// Default/system-filter buckets ("default:<origin>") as report rows.
+fn build_unmatched(store: &Store) -> Result<Vec<UnmatchedRow>> {
+    let labels = store.bucket_labels().unwrap_or_default();
+    Ok(store
+        .unmatched_usage()?
+        .into_iter()
+        .map(|usage| {
+            let origin = usage.rule_id.strip_prefix("default:").unwrap_or(&usage.rule_id);
+            let label = labels.get(&usage.rule_id).cloned().unwrap_or_else(|| origin.to_string());
+            UnmatchedRow {
+                filter_id: String::new(),
+                boot_session: String::new(),
+                filter_name: describe_origin(&label),
+                usage,
+            }
+        })
+        .collect())
+}
+
+/// Instant startup: build a result from the cached rule set + whatever the
+/// store already holds, without the (slow) live rule enumeration. Returns
+/// None if there's no cache yet. A full analyze() refresh follows.
+pub fn quick_cached_result(db_path: &Path) -> Option<AnalysisResult> {
+    let rules = firewall_rules::load_rules_cache()?;
+    let store = Store::open(db_path).ok()?;
+    let all_usage = store.all_usage().ok()?;
+    let listener_list = listeners::enumerate_listeners().unwrap_or_default();
+    let rows = build_rows(rules, &all_usage, &listener_list);
+    let unmatched = build_unmatched(&store).unwrap_or_default();
+    Some(AnalysisResult {
+        rows,
+        ctx: ui::AuditContext {
+            hostname: hostname(),
+            auditing_active: true,
+            collection_started: store.get_meta("collection_started").ok().flatten(),
+            last_ingest: store.get_meta("last_ingest").ok().flatten(),
+            events_processed: 0,
+            unmatched_events: 0,
+            note: "Showing cached rules — refreshing from Windows…".into(),
+        },
+        unmatched,
+        listeners: listener_list,
+    })
+}
+
 /// The rule table without any usage data — for the first-run screen before
 /// auditing is enabled (rules + scope + current listeners are still useful).
 pub fn rules_only(progress: &dyn Fn(&str)) -> Result<AnalysisResult> {
     progress("Enumerating firewall rules…");
     let rules = firewall_rules::enumerate_rules().context("enumerating firewall rules")?;
+    firewall_rules::save_rules_cache(&rules);
     progress("Enumerating listening sockets…");
     let listeners = listeners::enumerate_listeners().unwrap_or_default();
-    let rows = rules
-        .into_iter()
-        .map(|rule| {
-            let flags = baseline_checks::flags_for(&rule);
-            let listening = listeners::listeners_for_rule(&rule, &listeners);
-            let target_enabled = rule.is_enabled();
-            ui::RuleRow {
-                rule,
-                usage: None,
-                flags,
-                seen_apps: Vec::new(),
-                listening,
-                target_enabled,
-            }
-        })
-        .collect();
+    let empty = std::collections::HashMap::new();
+    let rows = build_rows(rules, &empty, &listeners);
     Ok(AnalysisResult {
         rows,
         ctx: ui::AuditContext {
@@ -184,6 +254,7 @@ pub fn analyze(db_path: &Path, progress: &dyn Fn(&str)) -> Result<AnalysisResult
     let checkpoint = store.checkpoint_record_id()?;
     progress("Loading firewall rules…");
     let rules = firewall_rules::enumerate_rules().context("enumerating firewall rules")?;
+    firewall_rules::save_rules_cache(&rules);
     let now = now_iso();
     store.snapshot_rules(&rules, &now)?;
 
@@ -292,67 +363,13 @@ pub fn analyze(db_path: &Path, progress: &dyn Fn(&str)) -> Result<AnalysisResult
     let listener_list = listeners::enumerate_listeners().unwrap_or_default();
 
     progress("Building report…");
-    let all_usage = store.all_usage()?;
-    let mut rows: Vec<ui::RuleRow> = Vec::new();
-    for rule in rules {
-        // usage by exact InstanceID, else by the DisplayName+direction group
-        // (profile variants share it)
-        let usage = all_usage
-            .get(&rule.name)
-            .or_else(|| all_usage.get(&disp_key(&rule.display_name, &rule.direction)))
-            .cloned();
-        let flags = baseline_checks::flags_for(&rule);
-        let seen_apps: Vec<String> = usage
-            .as_ref()
-            .map(|u| {
-                let mut names = BTreeSet::new();
-                for (path, _hits) in u.apps.iter().take(8) {
-                    let ident = app_identity::identify(path);
-                    if ident.company.is_empty() {
-                        names.insert(ident.friendly_name);
-                    } else {
-                        names.insert(format!("{} ({})", ident.friendly_name, ident.company));
-                    }
-                }
-                names.into_iter().collect()
-            })
-            .unwrap_or_default();
-        let listening = listeners::listeners_for_rule(&rule, &listener_list);
-        let target_enabled = rule.is_enabled();
-        rows.push(ui::RuleRow {
-            rule,
-            usage,
-            flags,
-            seen_apps,
-            listening,
-            target_enabled,
-        });
-    }
-
-    // default/system-filter buckets: "default:<origin>" rows in the store
-    let stored_labels = store.bucket_labels().unwrap_or_default();
-    let unmatched = store
-        .unmatched_usage()?
-        .into_iter()
-        .map(|usage| {
-            let origin = usage.rule_id.strip_prefix("default:").unwrap_or(&usage.rule_id);
-            let label = bucket_labels
-                .get(&usage.rule_id)
-                .cloned()
-                .or_else(|| stored_labels.get(&usage.rule_id).cloned())
-                .unwrap_or_else(|| origin.to_string());
-            UnmatchedRow {
-                filter_id: String::new(),
-                boot_session: String::new(),
-                filter_name: describe_origin(&label),
-                usage,
-            }
-        })
-        .collect();
-    // persist labels so they survive across runs
+    // persist bucket labels so they survive across runs
     for (id, label) in &bucket_labels {
         let _ = store.set_bucket_label(id, label);
     }
+    let all_usage = store.all_usage()?;
+    let rows = build_rows(rules, &all_usage, &listener_list);
+    let unmatched = build_unmatched(&store)?;
 
     let ctx = ui::AuditContext {
         hostname: hostname(),

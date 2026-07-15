@@ -3,7 +3,7 @@
 //! table is custom-painted for exact grid, checkbox-intent, chip, and
 //! accent-edge fidelity.
 
-use super::{cell_text, chip, App, Phase, Sort, Tab};
+use super::{cell_text, chip, App, DirFilter, Phase, Sort, Tab};
 use crate::listeners::{self, Listener};
 use crate::theme::{self as t};
 use crate::time_util;
@@ -104,6 +104,10 @@ pub fn window(app: &mut App, ctx: &egui::Context) {
     if app.confirm_open {
         confirm_modal(app, ctx);
     }
+    // 1px window border on a foreground layer (we draw our own chrome)
+    let screen = ctx.screen_rect();
+    ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("winborder")))
+        .rect_stroke(screen.shrink(0.5), 0.0, Stroke::new(1.0, t::BORDER));
 }
 
 // ---- title bar ----
@@ -114,36 +118,51 @@ fn titlebar(app: &App, ctx: &egui::Context) {
         .frame(egui::Frame::none().fill(t::TITLEBAR))
         .show(ctx, |ui| {
             let rect = ui.max_rect();
+            // window controls occupy the right ~138px; the rest is a drag zone
+            let controls_w = 46.0 * 3.0;
+            let drag_rect = Rect::from_min_max(rect.min, Pos2::new(rect.right() - controls_w, rect.bottom()));
+            let drag = ui.interact(drag_rect, ui.id().with("tb_drag"), Sense::click_and_drag());
+            if drag.drag_started() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            }
+            if drag.double_clicked() {
+                let maxed = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maxed));
+            }
+
             let p = ui.painter();
             super::stroke_bottom(p, rect, t::BORDER);
-            // logo square
             let logo = Rect::from_min_size(Pos2::new(rect.left() + 12.0, rect.center().y - 6.0), Vec2::splat(12.0));
             p.rect_filled(logo, 0.0, t::LOGO_RED);
-            p.text(
-                Pos2::new(logo.right() + 8.0, rect.center().y),
-                Align2::LEFT_CENTER,
-                "firebreak",
-                t::semibold(12.0),
-                t::INK,
-            );
-            let host = if app.ctx_info.hostname.is_empty() {
-                String::new()
-            } else {
-                format!(" · {}", app.ctx_info.hostname)
-            };
-            p.text(
-                Pos2::new(logo.right() + 8.0 + 66.0, rect.center().y),
-                Align2::LEFT_CENTER,
-                format!("— Windows Firewall usage audit{host}"),
-                t::sans(11.0),
-                t::FAINT,
-            );
-            for i in 0..3 {
-                let c = Pos2::new(rect.right() - 42.0 * (3.0 - i as f32) + 21.0, rect.center().y);
+            p.text(Pos2::new(logo.right() + 8.0, rect.center().y), Align2::LEFT_CENTER, "firebreak", t::semibold(12.0), t::INK);
+            let host = if app.ctx_info.hostname.is_empty() { String::new() } else { format!(" · {}", app.ctx_info.hostname) };
+            p.text(Pos2::new(logo.right() + 74.0, rect.center().y), Align2::LEFT_CENTER, format!("— Windows Firewall usage audit{host}"), t::sans(11.0), t::FAINT);
+
+            // min / max / close — each a 46px hit target
+            for i in 0..3u8 {
+                let bx = Rect::from_min_size(Pos2::new(rect.right() - 46.0 * (3.0 - i as f32), rect.top()), Vec2::new(46.0, TITLEBAR_H));
+                let r = ui.interact(bx, ui.id().with(("winbtn", i)), Sense::click());
+                let hovered = r.hovered();
+                let is_close = i == 2;
+                if hovered {
+                    ui.painter().rect_filled(bx, 0.0, if is_close { t::DESTRUCTIVE } else { Color32::from_rgb(0xDD, 0xE1, 0xE6) });
+                }
+                let col = if hovered && is_close { Color32::WHITE } else { t::TERTIARY };
+                let c = bx.center();
                 match i {
-                    0 => glyph::minimize(p, c, t::TERTIARY),
-                    1 => glyph::restore(p, c, t::TERTIARY),
-                    _ => glyph::cross(p, c, 9.0, t::TERTIARY),
+                    0 => glyph::minimize(ui.painter(), c, col),
+                    1 => glyph::restore(ui.painter(), c, col),
+                    _ => glyph::cross(ui.painter(), c, 9.0, col),
+                }
+                if r.clicked() {
+                    match i {
+                        0 => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
+                        1 => {
+                            let maxed = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maxed));
+                        }
+                        _ => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                    }
                 }
             }
         });
@@ -158,6 +177,13 @@ fn header(app: &mut App, ctx: &egui::Context) {
             super::stroke_bottom(ui.painter(), ui.max_rect().expand2(Vec2::new(PAGE, 10.0)), t::BORDER_LIGHT);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
+                // before the audit check completes, don't assert "off"
+                if !app.audit_checked && app.phase == Phase::Loading {
+                    dot(ui, t::ADVISORY);
+                    ui.add_space(8.0);
+                    stat(ui, "Detecting…", "checking Windows audit policy");
+                    return;
+                }
                 let active = app.ctx_info.auditing_active;
                 dot(ui, if active { t::LIVE } else { t::CB_EMPTY_BORDER });
                 ui.add_space(8.0);
@@ -348,41 +374,51 @@ fn firstrun_band(app: &mut App, ctx: &egui::Context) {
 
 // ---- filter bar ----
 
+const CTRL_H: f32 = 25.0; // shared height for all filter-bar controls
+
 fn filter_bar(app: &mut App, ctx: &egui::Context) {
     egui::TopBottomPanel::top("filterbar")
         .frame(egui::Frame::none().fill(t::CHROME).inner_margin(egui::Margin::symmetric(PAGE, 7.0)))
         .show(ctx, |ui| {
             super::stroke_bottom(ui.painter(), ui.max_rect().expand2(Vec2::new(PAGE, 7.0)), t::BORDER_LIGHT);
+            // one row, everything vertically centered to CTRL_H so the groups
+            // line up exactly
             ui.horizontal(|ui| {
-                // search box with a drawn magnifier
-                let search = egui::TextEdit::singleline(&mut app.filter_text)
-                    .hint_text("  Filter rules…")
-                    .desired_width(224.0)
-                    .font(t::sans(12.0));
-                let resp = ui.add(search);
-                glyph::magnifier(ui.painter(), Pos2::new(resp.rect.left() + 10.0, resp.rect.center().y), t::FAINT);
-                ui.add_space(4.0);
+                ui.set_height(CTRL_H);
+                ui.spacing_mut().item_spacing = Vec2::new(6.0, 0.0);
 
-                // enabled/zero-hit/flagged segmented group
-                let zero_enabled = app.ctx_info.auditing_active;
-                segmented3(
-                    ui,
-                    [
-                        ("Enabled only", &mut app.only_enabled, true),
-                        ("Zero-hit", &mut app.only_zero_hit, zero_enabled),
-                        ("Flagged", &mut app.only_flagged, true),
-                    ],
-                );
+                // search box (fixed height frame so it matches the segments)
+                let search = egui::TextEdit::singleline(&mut app.filter_text)
+                    .hint_text("      Filter rules…")
+                    .desired_width(210.0)
+                    .font(t::sans(12.0))
+                    .margin(egui::Margin { left: 8.0, right: 8.0, top: 4.0, bottom: 4.0 });
+                let resp = ui.add_sized(Vec2::new(224.0, CTRL_H), search);
+                glyph::magnifier(ui.painter(), Pos2::new(resp.rect.left() + 12.0, resp.rect.center().y), t::FAINT);
+
+                // direction filter (default In) — the primary audit lens
+                let dir = app.dir_filter;
+                let mut new_dir = dir;
+                segmented_choice(ui, &[
+                    ("In", DirFilter::In),
+                    ("Out", DirFilter::Out),
+                    ("All", DirFilter::All),
+                ], dir, &mut new_dir);
+                app.dir_filter = new_dir;
+
                 ui.add_space(4.0);
-                // profile group
-                segmented3(
-                    ui,
-                    [
-                        ("Domain", &mut app.show_domain, true),
-                        ("Private", &mut app.show_private, true),
-                        ("Public", &mut app.show_public, true),
-                    ],
-                );
+                let zero_enabled = app.ctx_info.auditing_active;
+                segmented_toggles(ui, &mut [
+                    ("Enabled only", &mut app.only_enabled, true),
+                    ("Zero-hit", &mut app.only_zero_hit, zero_enabled),
+                    ("Flagged", &mut app.only_flagged, true),
+                ]);
+                ui.add_space(4.0);
+                segmented_toggles(ui, &mut [
+                    ("Domain", &mut app.show_domain, true),
+                    ("Private", &mut app.show_private, true),
+                    ("Public", &mut app.show_public, true),
+                ]);
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let total = app.rows.len();
@@ -398,43 +434,50 @@ fn filter_bar(app: &mut App, ctx: &egui::Context) {
         });
 }
 
-/// Three-segment toggle group with the dark active fill from the design.
-fn segmented3(ui: &mut egui::Ui, segs: [(&str, &mut bool, bool); 3]) {
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 0.0;
-        let n = segs.len();
-        for (i, (label, state, enabled)) in segs.into_iter().enumerate() {
-            let galley_col = if *state { Color32::WHITE } else if enabled { t::SECONDARY } else { t::CB_EMPTY_BORDER };
-            let galley = ui.painter().layout_no_wrap(label.to_string(), t::sans(11.5), galley_col);
-            let size = Vec2::new(galley.size().x + 20.0, galley.size().y + 8.0);
-            let sense = if enabled { Sense::click() } else { Sense::hover() };
-            let (rect, resp) = ui.allocate_exact_size(size, sense);
-            let fill = if *state { t::DARK_SEGMENT } else { Color32::WHITE };
-            ui.painter().rect_filled(rect, 0.0, fill);
-            // outer + inter-segment borders
-            let border = Stroke::new(1.0, t::CONTROL_BORDER);
-            if i == 0 {
-                ui.painter().rect_stroke(rect, 0.0, border);
-            } else {
-                ui.painter().rect_stroke(rect, 0.0, Stroke::NONE);
-                ui.painter().hline(rect.x_range(), rect.top() + 0.5, border);
-                ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, border);
-                ui.painter().vline(rect.right() - 0.5, rect.y_range(), border);
-                let seam = if *state || segs_prev_active(i) { t::SECONDARY } else { t::CONTROL_BORDER };
-                ui.painter().vline(rect.left() + 0.5, rect.y_range(), Stroke::new(1.0, seam));
-            }
-            let _ = n;
-            ui.painter().galley(rect.center() - galley.size() / 2.0, galley, galley_col);
-            if enabled && resp.clicked() {
-                *state = !*state;
-            }
-        }
-    });
+/// One segment cell of a segmented control; returns its click response.
+/// `first` controls the left border; height is fixed to CTRL_H so groups
+/// align regardless of label width.
+fn segment_cell(ui: &mut egui::Ui, label: &str, active: bool, enabled: bool, first: bool) -> egui::Response {
+    let text_col = if active { Color32::WHITE } else if enabled { t::SECONDARY } else { t::CB_EMPTY_BORDER };
+    let galley = ui.painter().layout_no_wrap(label.to_string(), t::sans(11.5), text_col);
+    let w = galley.size().x + 20.0;
+    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, CTRL_H), sense);
+    let fill = if active { t::DARK_SEGMENT } else if resp.hovered() && enabled { t::HOVER_WASH } else { Color32::WHITE };
+    ui.painter().rect_filled(rect, 0.0, fill);
+    let border = Stroke::new(1.0, t::CONTROL_BORDER);
+    ui.painter().hline(rect.x_range(), rect.top() + 0.5, border);
+    ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, border);
+    ui.painter().vline(rect.right() - 0.5, rect.y_range(), border);
+    if first {
+        ui.painter().vline(rect.left() + 0.5, rect.y_range(), border);
+    }
+    ui.painter().galley(rect.center() - galley.size() / 2.0, galley, text_col);
+    resp
 }
 
-// segmented seam color helper can't see siblings cheaply; approximate
-fn segs_prev_active(_i: usize) -> bool {
-    false
+/// Segmented multi-toggle (each cell independently on/off).
+fn segmented_toggles(ui: &mut egui::Ui, segs: &mut [(&str, &mut bool, bool)]) {
+    let prev = ui.spacing().item_spacing;
+    ui.spacing_mut().item_spacing.x = 0.0;
+    for (i, (label, state, enabled)) in segs.iter_mut().enumerate() {
+        if segment_cell(ui, label, **state, *enabled, i == 0).clicked() && *enabled {
+            **state = !**state;
+        }
+    }
+    ui.spacing_mut().item_spacing = prev;
+}
+
+/// Segmented single-choice (exactly one active).
+fn segmented_choice<T: PartialEq + Copy>(ui: &mut egui::Ui, segs: &[(&str, T)], current: T, out: &mut T) {
+    let prev = ui.spacing().item_spacing;
+    ui.spacing_mut().item_spacing.x = 0.0;
+    for (i, (label, val)) in segs.iter().enumerate() {
+        if segment_cell(ui, label, *val == current, true, i == 0).clicked() {
+            *out = *val;
+        }
+    }
+    ui.spacing_mut().item_spacing = prev;
 }
 
 // ---- central: table + empty state ----
@@ -1019,9 +1062,16 @@ fn drawer(app: &mut App, ctx: &egui::Context) {
     if app.rows.is_empty() {
         return;
     }
-    egui::TopBottomPanel::bottom("drawer")
-        .frame(egui::Frame::none().fill(t::RAISED))
-        .show(ctx, |ui| {
+    let mut panel = egui::TopBottomPanel::bottom("drawer")
+        .frame(egui::Frame::none().fill(t::RAISED));
+    // resizable only while open, with a comfortable default that shows the
+    // tab body; collapsed = just the 27px tab bar
+    if app.drawer_open {
+        panel = panel.resizable(true).default_height(190.0).min_height(90.0).max_height(460.0);
+    } else {
+        panel = panel.resizable(false).exact_height(28.0);
+    }
+    panel.show(ctx, |ui| {
             // tab bar
             let bar = ui.allocate_exact_size(Vec2::new(ui.available_width(), 27.0), Sense::hover()).0;
             ui.painter().hline(bar.x_range(), bar.bottom() - 0.5, Stroke::new(1.0, t::BORDER_LIGHT));
@@ -1063,7 +1113,8 @@ fn drawer(app: &mut App, ctx: &egui::Context) {
             }
 
             if app.drawer_open {
-                ui.allocate_ui(Vec2::new(ui.available_width(), 118.0), |ui| match app.tab {
+                let h = ui.available_height().max(40.0);
+                ui.allocate_ui(Vec2::new(ui.available_width(), h), |ui| match app.tab {
                     Tab::Sockets => sockets_body(app, ui),
                     Tab::Unattributed => unattributed_body(app, ui),
                 });
