@@ -48,8 +48,8 @@ mod win {
         }
     }
 
-    pub fn open_query(xpath: &str, forward: bool) -> Result<Handle> {
-        let channel = to_wide("Security");
+    pub fn open_query(channel: &str, xpath: &str, forward: bool) -> Result<Handle> {
+        let channel = to_wide(channel);
         let query = to_wide(xpath);
         let direction = if forward {
             EvtQueryForwardDirection.0
@@ -63,7 +63,7 @@ mod win {
                 PCWSTR(query.as_ptr()),
                 (EvtQueryChannelPath.0 | direction) as u32,
             )
-            .context("EvtQuery on Security channel failed (needs elevation / Event Log Readers)")?;
+            .context("EvtQuery failed (needs elevation / Event Log Readers)")?;
             Ok(Handle(h))
         }
     }
@@ -125,7 +125,7 @@ pub fn query_events(
     since_record_id: Option<u64>,
     mut on_event: impl FnMut(EventRecord),
 ) -> Result<u64> {
-    let result_set = win::open_query(&build_query(since_record_id), true)?;
+    let result_set = win::open_query("Security", &build_query(since_record_id), true)?;
     let mut total: u64 = 0;
     let mut render_buf: Vec<u16> = Vec::new();
     loop {
@@ -155,8 +155,8 @@ pub fn query_events(
 
 /// First event XML matching `xpath`, from either end of the channel.
 #[cfg(windows)]
-fn first_xml(xpath: &str, forward: bool) -> Result<Option<String>> {
-    let result_set = win::open_query(xpath, forward)?;
+fn first_xml(channel: &str, xpath: &str, forward: bool) -> Result<Option<String>> {
+    let result_set = win::open_query(channel, xpath, forward)?;
     let mut handles = [0isize; 1];
     let returned = win::next_batch(&result_set, &mut handles)?;
     if returned == 0 {
@@ -166,12 +166,54 @@ fn first_xml(xpath: &str, forward: bool) -> Result<Option<String>> {
     Ok(win::render_xml(handles[0], &mut buf))
 }
 
+/// Boot-session start times (ascending, ISO8601 UTC), from System log event
+/// 6005 ("event log service started" — one per boot). WFP filter run-time
+/// IDs are only meaningful within one boot session, so events must be
+/// resolved against the filter map of *their* session, not the current one.
+/// Empty when the System log holds no boot markers (cleared log) — callers
+/// should then fall back to treating all events as the current session.
+#[cfg(windows)]
+pub fn boot_times() -> Result<Vec<String>> {
+    let xpath = "*[System[Provider[@Name='EventLog'] and (EventID=6005)]]";
+    let result_set = win::open_query("System", xpath, true)?;
+    let mut out = Vec::new();
+    let mut buf = Vec::new();
+    loop {
+        let mut handles = [0isize; 64];
+        let returned = win::next_batch(&result_set, &mut handles)?;
+        if returned == 0 {
+            break;
+        }
+        for &raw in handles.iter().take(returned as usize) {
+            if let Some(xml) = win::render_xml(raw, &mut buf) {
+                if let Some(t) = parse_system_time(&xml) {
+                    out.push(t);
+                }
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+#[cfg(not(windows))]
+pub fn boot_times() -> Result<Vec<String>> {
+    bail!("event log query is only available on Windows")
+}
+
+/// Extract the TimeCreated SystemTime attribute from rendered event XML.
+pub fn parse_system_time(xml: &str) -> Option<String> {
+    let anchor = xml.find("SystemTime='")? + "SystemTime='".len();
+    let end = xml[anchor..].find('\'')? + anchor;
+    Some(xml[anchor..end].to_string())
+}
+
 /// Timestamp of the oldest surviving 5156/5157 event (used as the adopted
 /// collection start when auditing predates this tool). None if no such
 /// events exist.
 #[cfg(windows)]
 pub fn first_event_time() -> Result<Option<String>> {
-    Ok(first_xml(&build_query(None), true)?
+    Ok(first_xml("Security", &build_query(None), true)?
         .and_then(|xml| parse_event_xml(&xml))
         .map(|ev| ev.time_created))
 }
@@ -186,7 +228,7 @@ pub fn first_event_time() -> Result<Option<String>> {
 /// between were lost to log rollover (or the log was cleared).
 #[cfg(windows)]
 pub fn oldest_record_id() -> Result<Option<u64>> {
-    Ok(first_xml("*", true)?.and_then(|xml| parse_record_id(&xml)))
+    Ok(first_xml("Security", "*", true)?.and_then(|xml| parse_record_id(&xml)))
 }
 
 #[cfg(not(windows))]
@@ -198,7 +240,7 @@ pub fn oldest_record_id() -> Result<Option<u64>> {
 /// auditing is first enabled (skip everything that predates enablement).
 #[cfg(windows)]
 pub fn newest_record_id() -> Result<Option<u64>> {
-    Ok(first_xml("*", false)?.and_then(|xml| parse_record_id(&xml)))
+    Ok(first_xml("Security", "*", false)?.and_then(|xml| parse_record_id(&xml)))
 }
 
 #[cfg(not(windows))]

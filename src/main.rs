@@ -177,6 +177,27 @@ fn main() -> Result<()> {
     let filters = filter_map::enumerate_filters().context("enumerating WFP filters")?;
     let rule_map = filter_map::build_filter_rule_map(&filters, &rules);
 
+    // WFP filter run-time IDs are only meaningful within one boot session:
+    // the same numeric ID can name a different filter after a reboot. Events
+    // are therefore resolved against the filter map of *their* session —
+    // current enumeration for current-boot events, recorded mappings for
+    // older ones — never across sessions.
+    let boots = event_query::boot_times().unwrap_or_default();
+    let current_boot = boots.last().cloned().unwrap_or_default();
+    if boots.is_empty() {
+        eprintln!(
+            "warning: no boot markers (System log 6005) found — treating all events as the \
+             current boot session; cross-boot attribution may be less precise"
+        );
+    }
+    // boot session of an event = latest boot start <= event time
+    let session_of = |ev_time: &str| -> String {
+        match boots.iter().rev().find(|b| b.as_str() <= ev_time) {
+            Some(b) => b.clone(),
+            None => current_boot.clone(),
+        }
+    };
+
     // everything from here to the checkpoint advance is one transaction:
     // a crash rolls back cleanly and a rerun re-ingests from the old
     // checkpoint without double-counting
@@ -187,7 +208,7 @@ fn main() -> Result<()> {
             Some((id, via)) => (Some(id.as_str()), via.as_str()),
             None => (None, MappedVia::Unmatched.as_str()),
         };
-        store.upsert_filter_mapping(f.filter_id, rule_id, &f.name, via, &now)?;
+        store.upsert_filter_mapping(f.filter_id, &current_boot, rule_id, &f.name, via, &now)?;
     }
 
     let device_map = app_identity::device_path_map();
@@ -196,7 +217,7 @@ fn main() -> Result<()> {
     let mut max_record_id: Option<u64> = None;
     let mut errors: u64 = 0;
     // filter IDs repeat heavily across events; cache DB lookups for the run
-    let mut historical_memo: std::collections::HashMap<u64, Option<String>> =
+    let mut historical_memo: std::collections::HashMap<(u64, String), Option<String>> =
         std::collections::HashMap::new();
 
     let ingest = event_query::query_events(checkpoint, |ev| {
@@ -204,17 +225,29 @@ fn main() -> Result<()> {
         if max_record_id.map_or(true, |m| ev.record_id > m) {
             max_record_id = Some(ev.record_id);
         }
-        let rule_id = match rule_map.get(&ev.filter_rtid) {
-            Some((id, _)) => id.clone(),
+        let session = session_of(&ev.time_created);
+        // current-boot events use the live enumeration; everything else (and
+        // live filters since deleted) goes through the per-session DB map
+        let current_hit = if session == current_boot {
+            rule_map.get(&ev.filter_rtid).map(|(id, _)| id.clone())
+        } else {
+            None
+        };
+        let rule_id = match current_hit {
+            Some(id) => id,
             None => {
-                let cached = historical_memo.entry(ev.filter_rtid).or_insert_with(|| {
-                    store.historical_filter_rule(ev.filter_rtid).ok().flatten()
+                let key = (ev.filter_rtid, session.clone());
+                let cached = historical_memo.entry(key).or_insert_with(|| {
+                    store
+                        .historical_filter_rule(ev.filter_rtid, &session)
+                        .ok()
+                        .flatten()
                 });
                 match cached {
                     Some(id) => id.clone(),
                     None => {
                         unmatched_events += 1;
-                        format!("unmatched:{}", ev.filter_rtid)
+                        format!("unmatched:{}:{}", session, ev.filter_rtid)
                     }
                 }
             }

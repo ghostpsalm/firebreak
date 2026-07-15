@@ -33,8 +33,8 @@ impl Store {
             );
 
             -- rolled-up usage per rule; rule_id is the firewall rule Name
-            -- (InstanceID), or 'unmatched:<filter_id>' for events whose
-            -- filter never resolved to a rule
+            -- (InstanceID), or 'unmatched:<boot_session>:<filter_id>' for
+            -- events whose filter never resolved to a rule
             CREATE TABLE IF NOT EXISTS rule_usage (
                 rule_id     TEXT PRIMARY KEY,
                 allow_count INTEGER NOT NULL DEFAULT 0,
@@ -51,16 +51,19 @@ impl Store {
                 PRIMARY KEY (rule_id, app_path)
             );
 
-            -- WFP filter-id -> rule mapping, persisted per run. Filter
-            -- run-time IDs regenerate on reboot/rule reload, so keeping
-            -- historical mappings lets a later run resolve events recorded
-            -- during an earlier boot session.
+            -- WFP filter-id -> rule mapping, persisted per run and keyed by
+            -- boot session (boot start time, ISO). Filter run-time IDs are
+            -- only meaningful within one boot: the same numeric ID can name
+            -- a different filter after a reboot, so a mapping must never be
+            -- applied to events from another session.
             CREATE TABLE IF NOT EXISTS filter_map (
-                filter_id    INTEGER PRIMARY KEY,
+                filter_id    INTEGER NOT NULL,
+                boot_session TEXT NOT NULL,
                 rule_id      TEXT,
                 filter_name  TEXT,
                 mapped_via   TEXT,
-                last_seen_at TEXT NOT NULL
+                last_seen_at TEXT NOT NULL,
+                PRIMARY KEY (filter_id, boot_session)
             );
 
             -- snapshot of the enabled rule set at audit-enable time and on
@@ -155,34 +158,48 @@ impl Store {
         Ok(())
     }
 
+    /// COALESCE keeps an earlier same-session mapping alive if the filter
+    /// has since been deleted (rule removed mid-boot): a currently-unmatched
+    /// re-sighting must not NULL out the mapping older events still need.
     pub fn upsert_filter_mapping(
         &self,
         filter_id: u64,
+        boot_session: &str,
         rule_id: Option<&str>,
         filter_name: &str,
         mapped_via: &str,
         now_iso: &str,
     ) -> Result<()> {
         let mut stmt = self.conn.prepare_cached(
-            "INSERT INTO filter_map (filter_id, rule_id, filter_name, mapped_via, last_seen_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(filter_id) DO UPDATE SET
-                rule_id = excluded.rule_id,
+            "INSERT INTO filter_map (filter_id, boot_session, rule_id, filter_name, mapped_via, last_seen_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(filter_id, boot_session) DO UPDATE SET
+                rule_id = COALESCE(excluded.rule_id, rule_id),
                 filter_name = excluded.filter_name,
-                mapped_via = excluded.mapped_via,
+                mapped_via = CASE WHEN excluded.rule_id IS NULL AND rule_id IS NOT NULL
+                                  THEN mapped_via ELSE excluded.mapped_via END,
                 last_seen_at = excluded.last_seen_at",
         )?;
-        stmt.execute(params![filter_id as i64, rule_id, filter_name, mapped_via, now_iso])?;
+        stmt.execute(params![
+            filter_id as i64,
+            boot_session,
+            rule_id,
+            filter_name,
+            mapped_via,
+            now_iso
+        ])?;
         Ok(())
     }
 
-    /// Look up a historical mapping for a filter id not present in the
-    /// current WFP enumeration (e.g. events from a previous boot session).
-    pub fn historical_filter_rule(&self, filter_id: u64) -> Result<Option<String>> {
-        let mut stmt = self
-            .conn
-            .prepare_cached("SELECT rule_id FROM filter_map WHERE filter_id = ?1 AND rule_id IS NOT NULL")?;
-        let mut rows = stmt.query(params![filter_id as i64])?;
+    /// Look up a recorded mapping for a filter id within a specific boot
+    /// session — used for events from sessions other than the current one,
+    /// and for current-session filters that no longer exist.
+    pub fn historical_filter_rule(&self, filter_id: u64, boot_session: &str) -> Result<Option<String>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT rule_id FROM filter_map
+             WHERE filter_id = ?1 AND boot_session = ?2 AND rule_id IS NOT NULL",
+        )?;
+        let mut rows = stmt.query(params![filter_id as i64, boot_session])?;
         Ok(match rows.next()? {
             Some(row) => Some(row.get(0)?),
             None => None,
