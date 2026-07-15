@@ -160,3 +160,37 @@ pub fn identify(path: &str) -> AppIdentity {
         company: String::new(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn map() -> HashMap<String, String> {
+        HashMap::from([(r"\device\harddiskvolume3".to_string(), "C:".to_string())])
+    }
+
+    #[test]
+    fn normalizes_known_device_prefix() {
+        assert_eq!(
+            normalize_path(r"\device\harddiskvolume3\Windows\System32\svchost.exe", &map()),
+            r"C:\Windows\System32\svchost.exe"
+        );
+    }
+
+    #[test]
+    fn device_prefix_match_is_case_insensitive() {
+        assert_eq!(
+            normalize_path(r"\Device\HarddiskVolume3\app.exe", &map()),
+            r"C:\app.exe"
+        );
+    }
+
+    #[test]
+    fn unknown_paths_pass_through() {
+        assert_eq!(normalize_path("System", &map()), "System");
+        assert_eq!(
+            normalize_path(r"\device\harddiskvolume9\x.exe", &map()),
+            r"\device\harddiskvolume9\x.exe"
+        );
+    }
+}

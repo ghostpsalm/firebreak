@@ -316,3 +316,151 @@ impl Store {
         Ok(out)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TempStore {
+        store: Store,
+        dir: PathBuf,
+    }
+
+    impl TempStore {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "firebreak-test-{}-{}",
+                tag,
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let store = Store::open(&dir.join("t.db")).expect("open store");
+            TempStore { store, dir }
+        }
+    }
+
+    impl Drop for TempStore {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn ev(record_id: u64, event_id: u32, time: &str, rtid: u64) -> EventRecord {
+        EventRecord {
+            event_id,
+            record_id,
+            time_created: time.into(),
+            filter_rtid: rtid,
+            application: r"\device\hd1\a.exe".into(),
+            direction: "Outbound".into(),
+            protocol: 6,
+            dest_address: "1.2.3.4".into(),
+            dest_port: "443".into(),
+            source_address: "10.0.0.1".into(),
+            source_port: "50000".into(),
+        }
+    }
+
+    #[test]
+    fn events_aggregate_counts_apps_and_seen_range() {
+        let t = TempStore::new("agg");
+        t.store
+            .record_event("r1", &ev(1, 5156, "2026-07-02T00:00:00.000Z", 7), r"C:\a.exe")
+            .unwrap();
+        t.store
+            .record_event("r1", &ev(2, 5157, "2026-07-03T00:00:00.000Z", 7), r"C:\b.exe")
+            .unwrap();
+        t.store
+            .record_event("r1", &ev(3, 5156, "2026-07-01T00:00:00.000Z", 7), r"C:\a.exe")
+            .unwrap();
+        let u = t.store.all_usage().unwrap().remove("r1").expect("usage");
+        assert_eq!(u.allow_count, 2);
+        assert_eq!(u.block_count, 1);
+        assert_eq!(u.first_seen.as_deref(), Some("2026-07-01T00:00:00.000Z"));
+        assert_eq!(u.last_seen.as_deref(), Some("2026-07-03T00:00:00.000Z"));
+        assert_eq!(u.apps[0], (r"C:\a.exe".to_string(), 2)); // most hits first
+    }
+
+    #[test]
+    fn checkpoint_round_trips() {
+        let t = TempStore::new("cp");
+        assert_eq!(t.store.checkpoint_record_id().unwrap(), None);
+        t.store.set_checkpoint_record_id(42).unwrap();
+        assert_eq!(t.store.checkpoint_record_id().unwrap(), Some(42));
+    }
+
+    #[test]
+    fn unmatched_resighting_does_not_clobber_mapping() {
+        // regression for C-05
+        let t = TempStore::new("coalesce");
+        t.store
+            .upsert_filter_mapping(9, "boot-a", Some("rule-x"), "f", "provider_data", "t1")
+            .unwrap();
+        t.store
+            .upsert_filter_mapping(9, "boot-a", None, "f", "unmatched", "t2")
+            .unwrap();
+        assert_eq!(
+            t.store.historical_filter_rule(9, "boot-a").unwrap().as_deref(),
+            Some("rule-x")
+        );
+    }
+
+    #[test]
+    fn mappings_are_scoped_to_their_boot_session() {
+        // regression for C-01
+        let t = TempStore::new("boot");
+        t.store
+            .upsert_filter_mapping(9, "boot-a", Some("rule-x"), "f", "provider_data", "t1")
+            .unwrap();
+        assert_eq!(t.store.historical_filter_rule(9, "boot-b").unwrap(), None);
+    }
+
+    #[test]
+    fn snapshots_keep_only_first_and_latest() {
+        let t = TempStore::new("snap");
+        t.store.snapshot_rules(&[], "2026-07-01T00:00:00Z").unwrap();
+        t.store.snapshot_rules(&[], "2026-07-02T00:00:00Z").unwrap();
+        t.store.snapshot_rules(&[], "2026-07-03T00:00:00Z").unwrap();
+        let count: i64 = t
+            .store
+            .conn
+            .query_row("SELECT COUNT(*) FROM rule_snapshot", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+        let times: Vec<String> = {
+            let mut stmt = t
+                .store
+                .conn
+                .prepare("SELECT snapshot_at FROM rule_snapshot ORDER BY snapshot_at")
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(times, vec!["2026-07-01T00:00:00Z", "2026-07-03T00:00:00Z"]);
+    }
+
+    #[test]
+    fn unmatched_usage_filters_and_sorts() {
+        let t = TempStore::new("unmatched");
+        t.store
+            .record_event("unmatched:boot-a:5", &ev(1, 5156, "2026-07-01T00:00:00Z", 5), "a")
+            .unwrap();
+        for i in 0..3 {
+            t.store
+                .record_event(
+                    "unmatched:boot-a:6",
+                    &ev(2 + i, 5157, "2026-07-01T00:00:00Z", 6),
+                    "b",
+                )
+                .unwrap();
+        }
+        t.store
+            .record_event("real-rule", &ev(9, 5156, "2026-07-01T00:00:00Z", 7), "c")
+            .unwrap();
+        let unmatched = t.store.unmatched_usage().unwrap();
+        assert_eq!(unmatched.len(), 2);
+        assert_eq!(unmatched[0].rule_id, "unmatched:boot-a:6");
+    }
+}

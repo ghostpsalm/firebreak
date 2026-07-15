@@ -227,3 +227,85 @@ pub fn build_filter_rule_map(
     }
     map
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn filter(id: u64, name: &str, provider_data: &str) -> FilterInfo {
+        FilterInfo {
+            filter_id: id,
+            name: name.into(),
+            description: String::new(),
+            provider_data_utf16: provider_data.into(),
+            provider_data_hex: String::new(),
+            provider_context_key: String::new(),
+            layer_key: String::new(),
+        }
+    }
+
+    fn rule(name: &str, display: &str) -> RuleInfo {
+        RuleInfo {
+            name: name.into(),
+            display_name: display.into(),
+            description: None,
+            enabled: "True".into(),
+            direction: "Inbound".into(),
+            action: "Allow".into(),
+            profile: "Any".into(),
+            group: None,
+            program: None,
+            protocol: None,
+            local_port: None,
+            remote_port: None,
+        }
+    }
+
+    #[test]
+    fn tokens_extract_braced_guids_and_identifier_runs() {
+        let toks = candidate_tokens("v2.31|{a1b2c3d4-0000-1111-2222-333344445555}|CoreNet-DNS-Out");
+        assert!(toks.contains(&"{a1b2c3d4-0000-1111-2222-333344445555}"));
+        assert!(toks.contains(&"CoreNet-DNS-Out"));
+    }
+
+    #[test]
+    fn tokens_drop_short_runs() {
+        // identifier runs below MIN_TOKEN_LEN must not become candidates
+        let toks = candidate_tokens("ab cd efg something-longer");
+        assert!(!toks.contains(&"ab"));
+        assert!(!toks.contains(&"efg"));
+        assert!(toks.contains(&"something-longer"));
+    }
+
+    #[test]
+    fn provider_data_matches_by_exact_token() {
+        let rules = vec![rule("CoreNet-DNS-Out", "DNS out"), rule("{guid-1}", "Other")];
+        let filters = vec![filter(10, "irrelevant", "x|CoreNet-DNS-Out|y")];
+        let map = build_filter_rule_map(&filters, &rules);
+        assert_eq!(map[&10].0, "CoreNet-DNS-Out");
+        assert_eq!(map[&10].1, MappedVia::ProviderData);
+    }
+
+    #[test]
+    fn short_rule_name_cannot_swallow_filters() {
+        // regression for C-04: a rule named "e" used to substring-match everything
+        let rules = vec![rule("e", "Tiny rule")];
+        let filters = vec![filter(11, "some filter", "unrelated provider data text")];
+        let map = build_filter_rule_map(&filters, &rules);
+        assert!(!map.contains_key(&11));
+    }
+
+    #[test]
+    fn display_name_fallback_only_when_unambiguous() {
+        let rules = vec![
+            rule("{id-1}", "Shared Name"),
+            rule("{id-2}", "Shared Name"),
+            rule("{id-3}", "Unique Name"),
+        ];
+        let filters = vec![filter(20, "Shared Name", ""), filter(21, "Unique Name", "")];
+        let map = build_filter_rule_map(&filters, &rules);
+        assert!(!map.contains_key(&20), "ambiguous display name must not match");
+        assert_eq!(map[&21].0, "{id-3}");
+        assert_eq!(map[&21].1, MappedVia::DisplayName);
+    }
+}
