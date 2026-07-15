@@ -64,8 +64,17 @@ pub fn enumerate_filters() -> Result<Vec<FilterInfo>> {
                 }
                 for i in 0..returned as usize {
                     let f = &**entries.add(i);
-                    let provider_data =
-                        std::slice::from_raw_parts(f.providerData.data, f.providerData.size as usize);
+                    // providerData is absent (null/0) on most built-in filters;
+                    // from_raw_parts requires non-null even for empty slices
+                    let provider_data: &[u8] =
+                        if f.providerData.data.is_null() || f.providerData.size == 0 {
+                            &[]
+                        } else {
+                            std::slice::from_raw_parts(
+                                f.providerData.data,
+                                f.providerData.size as usize,
+                            )
+                        };
                     let (pd_utf16, pd_hex) = decode_provider_data(provider_data);
                     out.push(FilterInfo {
                         filter_id: f.filterId,
