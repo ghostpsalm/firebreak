@@ -1,183 +1,208 @@
-//! Pull 5156/5157 events from the Security channel since a checkpoint, via
-//! the modern EvtQuery API, rendered as XML and parsed with quick-xml.
+//! Pull 5156/5157 events from the Security channel via the modern EvtQuery
+//! API, rendered as XML and parsed with quick-xml.
+//!
+//! The ingestion cursor is the channel's EventRecordID — monotonic and
+//! gapless per channel — not a timestamp. XPath `EventRecordID > N` gives an
+//! exact resume point: no `>=` re-read hack, no risk of dropping events that
+//! land inside a same-millisecond window, and the cursor is an integer so
+//! nothing user-influencable is spliced into the query.
 
 #[cfg(not(windows))]
 use anyhow::bail;
-#[cfg(windows)]
-use anyhow::Context;
 use anyhow::Result;
 
 use crate::model::EventRecord;
 
-/// XPath filter for the Security channel. `since_iso` must be ISO8601 UTC
-/// with milliseconds, e.g. 2026-07-15T00:00:00.000Z.
-pub fn build_query(since_iso: Option<&str>) -> String {
-    match since_iso {
-        Some(ts) => format!(
-            "*[System[(EventID=5156 or EventID=5157) and TimeCreated[@SystemTime>='{}']]]",
-            ts
+/// XPath filter for 5156/5157, resuming strictly after `since_record_id`.
+pub fn build_query(since_record_id: Option<u64>) -> String {
+    match since_record_id {
+        Some(id) => format!(
+            "*[System[(EventID=5156 or EventID=5157) and EventRecordID > {}]]",
+            id
         ),
         None => "*[System[(EventID=5156 or EventID=5157)]]".to_string(),
     }
 }
 
 #[cfg(windows)]
-pub fn query_events(since_iso: Option<&str>, mut on_event: impl FnMut(EventRecord)) -> Result<u64> {
+mod win {
+    use anyhow::{Context, Result};
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::ERROR_NO_MORE_ITEMS;
     use windows::Win32::System::EventLog::{
         EvtClose, EvtNext, EvtQuery, EvtRender, EvtQueryChannelPath, EvtQueryForwardDirection,
-        EvtRenderEventXml, EVT_HANDLE,
+        EvtQueryReverseDirection, EvtRenderEventXml, EVT_HANDLE,
     };
 
     fn to_wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
-    let channel = to_wide("Security");
-    let query = to_wide(&build_query(since_iso));
-
-    unsafe {
-        let result_set: EVT_HANDLE = EvtQuery(
-            None,
-            PCWSTR(channel.as_ptr()),
-            PCWSTR(query.as_ptr()),
-            (EvtQueryChannelPath.0 | EvtQueryForwardDirection.0) as u32,
-        )
-        .context("EvtQuery on Security channel failed (needs elevation / Event Log Readers)")?;
-
-        let mut total: u64 = 0;
-        let mut render_buf: Vec<u16> = Vec::new();
-
-        loop {
-            // EvtNext hands back raw isize event handles in this binding
-            let mut handles = [0isize; 64];
-            let mut returned: u32 = 0;
-            let next = EvtNext(result_set, &mut handles, 0, 0, &mut returned);
-            if let Err(e) = next {
-                let _ = EvtClose(result_set);
-                if e.code() == windows::core::HRESULT::from_win32(ERROR_NO_MORE_ITEMS.0) {
-                    return Ok(total);
-                }
-                return Err(e).context("EvtNext failed");
+    /// RAII wrapper so every open handle is closed on all paths.
+    pub struct Handle(pub EVT_HANDLE);
+    impl Drop for Handle {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = EvtClose(self.0);
             }
-            for h in handles.iter().take(returned as usize) {
-                let h = EVT_HANDLE(*h);
-                let mut used: u32 = 0;
-                let mut props: u32 = 0;
-                // first call sizes the buffer
-                let _ = EvtRender(
-                    None,
-                    h,
-                    EvtRenderEventXml.0 as u32,
-                    0,
-                    None,
-                    &mut used,
-                    &mut props,
-                );
-                if used > 0 {
-                    render_buf.resize((used as usize + 1) / 2 + 1, 0);
-                    let cap_bytes = (render_buf.len() * 2) as u32;
-                    if EvtRender(
-                        None,
-                        h,
-                        EvtRenderEventXml.0 as u32,
-                        cap_bytes,
-                        Some(render_buf.as_mut_ptr() as *mut _),
-                        &mut used,
-                        &mut props,
-                    )
-                    .is_ok()
-                    {
-                        let xml = String::from_utf16_lossy(
-                            &render_buf[..(used as usize / 2).saturating_sub(1)],
-                        );
-                        if let Some(ev) = parse_event_xml(&xml) {
-                            total += 1;
-                            on_event(ev);
-                        }
-                    }
+        }
+    }
+
+    pub fn open_query(xpath: &str, forward: bool) -> Result<Handle> {
+        let channel = to_wide("Security");
+        let query = to_wide(xpath);
+        let direction = if forward {
+            EvtQueryForwardDirection.0
+        } else {
+            EvtQueryReverseDirection.0
+        };
+        unsafe {
+            let h = EvtQuery(
+                None,
+                PCWSTR(channel.as_ptr()),
+                PCWSTR(query.as_ptr()),
+                (EvtQueryChannelPath.0 | direction) as u32,
+            )
+            .context("EvtQuery on Security channel failed (needs elevation / Event Log Readers)")?;
+            Ok(Handle(h))
+        }
+    }
+
+    /// Fetch the next batch of raw event handles. Ok(0) = end of results.
+    pub fn next_batch(result_set: &Handle, handles: &mut [isize]) -> Result<u32> {
+        let mut returned: u32 = 0;
+        unsafe {
+            match EvtNext(result_set.0, handles, 0, 0, &mut returned) {
+                Ok(()) => Ok(returned),
+                Err(e) if e.code() == windows::core::HRESULT::from_win32(ERROR_NO_MORE_ITEMS.0) => {
+                    Ok(0)
                 }
-                let _ = EvtClose(h);
+                Err(e) => Err(e).context("EvtNext failed"),
+            }
+        }
+    }
+
+    /// Render one event handle to its XML string and close the handle.
+    pub fn render_xml(raw: isize, buf: &mut Vec<u16>) -> Option<String> {
+        unsafe {
+            let h = Handle(EVT_HANDLE(raw));
+            let mut used: u32 = 0;
+            let mut props: u32 = 0;
+            // first call sizes the buffer
+            let _ = EvtRender(
+                None,
+                h.0,
+                EvtRenderEventXml.0 as u32,
+                0,
+                None,
+                &mut used,
+                &mut props,
+            );
+            if used == 0 {
+                return None;
+            }
+            buf.resize((used as usize + 1) / 2 + 1, 0);
+            let cap_bytes = (buf.len() * 2) as u32;
+            EvtRender(
+                None,
+                h.0,
+                EvtRenderEventXml.0 as u32,
+                cap_bytes,
+                Some(buf.as_mut_ptr() as *mut _),
+                &mut used,
+                &mut props,
+            )
+            .ok()?;
+            Some(String::from_utf16_lossy(
+                &buf[..(used as usize / 2).saturating_sub(1)],
+            ))
+        }
+    }
+}
+
+#[cfg(windows)]
+pub fn query_events(
+    since_record_id: Option<u64>,
+    mut on_event: impl FnMut(EventRecord),
+) -> Result<u64> {
+    let result_set = win::open_query(&build_query(since_record_id), true)?;
+    let mut total: u64 = 0;
+    let mut render_buf: Vec<u16> = Vec::new();
+    loop {
+        let mut handles = [0isize; 64];
+        let returned = win::next_batch(&result_set, &mut handles)?;
+        if returned == 0 {
+            return Ok(total);
+        }
+        for &raw in handles.iter().take(returned as usize) {
+            if let Some(xml) = win::render_xml(raw, &mut render_buf) {
+                if let Some(ev) = parse_event_xml(&xml) {
+                    total += 1;
+                    on_event(ev);
+                }
             }
         }
     }
 }
 
 #[cfg(not(windows))]
-pub fn query_events(_since_iso: Option<&str>, _on_event: impl FnMut(EventRecord)) -> Result<u64> {
+pub fn query_events(
+    _since_record_id: Option<u64>,
+    _on_event: impl FnMut(EventRecord),
+) -> Result<u64> {
     bail!("event log query is only available on Windows")
 }
 
-/// Timestamp of the oldest surviving 5156/5157 event, for rollover
-/// detection. None if the log holds no such events.
+/// First event XML matching `xpath`, from either end of the channel.
+#[cfg(windows)]
+fn first_xml(xpath: &str, forward: bool) -> Result<Option<String>> {
+    let result_set = win::open_query(xpath, forward)?;
+    let mut handles = [0isize; 1];
+    let returned = win::next_batch(&result_set, &mut handles)?;
+    if returned == 0 {
+        return Ok(None);
+    }
+    let mut buf = Vec::new();
+    Ok(win::render_xml(handles[0], &mut buf))
+}
+
+/// Timestamp of the oldest surviving 5156/5157 event (used as the adopted
+/// collection start when auditing predates this tool). None if no such
+/// events exist.
 #[cfg(windows)]
 pub fn first_event_time() -> Result<Option<String>> {
-    use windows::core::PCWSTR;
-    use windows::Win32::Foundation::ERROR_NO_MORE_ITEMS;
-    use windows::Win32::System::EventLog::{
-        EvtClose, EvtNext, EvtQuery, EvtRender, EvtQueryChannelPath, EvtQueryForwardDirection,
-        EvtRenderEventXml, EVT_HANDLE,
-    };
-
-    let channel: Vec<u16> = "Security".encode_utf16().chain(std::iter::once(0)).collect();
-    let query: Vec<u16> = build_query(None)
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-
-    unsafe {
-        let result_set: EVT_HANDLE = EvtQuery(
-            None,
-            PCWSTR(channel.as_ptr()),
-            PCWSTR(query.as_ptr()),
-            (EvtQueryChannelPath.0 | EvtQueryForwardDirection.0) as u32,
-        )
-        .context("EvtQuery failed")?;
-
-        let mut handles = [0isize; 1];
-        let mut returned: u32 = 0;
-        let next = EvtNext(result_set, &mut handles, 0, 0, &mut returned);
-        if let Err(e) = next {
-            let _ = EvtClose(result_set);
-            if e.code() == windows::core::HRESULT::from_win32(ERROR_NO_MORE_ITEMS.0) {
-                return Ok(None);
-            }
-            return Err(e).context("EvtNext failed");
-        }
-        let mut out = None;
-        if returned > 0 {
-            let h = EVT_HANDLE(handles[0]);
-            let mut used: u32 = 0;
-            let mut props: u32 = 0;
-            let _ = EvtRender(None, h, EvtRenderEventXml.0 as u32, 0, None, &mut used, &mut props);
-            if used > 0 {
-                let mut buf: Vec<u16> = vec![0; (used as usize + 1) / 2 + 1];
-                let cap = (buf.len() * 2) as u32;
-                if EvtRender(
-                    None,
-                    h,
-                    EvtRenderEventXml.0 as u32,
-                    cap,
-                    Some(buf.as_mut_ptr() as *mut _),
-                    &mut used,
-                    &mut props,
-                )
-                .is_ok()
-                {
-                    let xml = String::from_utf16_lossy(&buf[..(used as usize / 2).saturating_sub(1)]);
-                    out = parse_event_xml(&xml).map(|ev| ev.time_created);
-                }
-            }
-            let _ = EvtClose(h);
-        }
-        let _ = EvtClose(result_set);
-        Ok(out)
-    }
+    Ok(first_xml(&build_query(None), true)?
+        .and_then(|xml| parse_event_xml(&xml))
+        .map(|ev| ev.time_created))
 }
 
 #[cfg(not(windows))]
 pub fn first_event_time() -> Result<Option<String>> {
+    bail!("event log query is only available on Windows")
+}
+
+/// Record ID of the oldest surviving event of ANY type in the channel —
+/// for coverage-gap detection: if this is above our checkpoint, records
+/// between were lost to log rollover (or the log was cleared).
+#[cfg(windows)]
+pub fn oldest_record_id() -> Result<Option<u64>> {
+    Ok(first_xml("*", true)?.and_then(|xml| parse_record_id(&xml)))
+}
+
+#[cfg(not(windows))]
+pub fn oldest_record_id() -> Result<Option<u64>> {
+    bail!("event log query is only available on Windows")
+}
+
+/// Record ID of the newest event in the channel — the starting cursor when
+/// auditing is first enabled (skip everything that predates enablement).
+#[cfg(windows)]
+pub fn newest_record_id() -> Result<Option<u64>> {
+    Ok(first_xml("*", false)?.and_then(|xml| parse_record_id(&xml)))
+}
+
+#[cfg(not(windows))]
+pub fn newest_record_id() -> Result<Option<u64>> {
     bail!("event log query is only available on Windows")
 }
 
@@ -191,6 +216,13 @@ fn decode_direction(raw: &str) -> String {
     }
 }
 
+/// Extract just the EventRecordID from any rendered event XML.
+pub fn parse_record_id(xml: &str) -> Option<u64> {
+    let start = xml.find("<EventRecordID>")? + "<EventRecordID>".len();
+    let end = xml[start..].find("</EventRecordID>")? + start;
+    xml[start..end].trim().parse().ok()
+}
+
 /// Parse one rendered event XML into an EventRecord. Returns None for
 /// events that don't carry the fields we need.
 pub fn parse_event_xml(xml: &str) -> Option<EventRecord> {
@@ -201,9 +233,11 @@ pub fn parse_event_xml(xml: &str) -> Option<EventRecord> {
     reader.config_mut().trim_text(true);
 
     let mut event_id: u32 = 0;
+    let mut record_id: u64 = 0;
     let mut time_created = String::new();
     let mut current_data_name: Option<String> = None;
     let mut in_event_id = false;
+    let mut in_record_id = false;
 
     let mut filter_rtid: Option<u64> = None;
     let mut application = String::new();
@@ -222,6 +256,7 @@ pub fn parse_event_xml(xml: &str) -> Option<EventRecord> {
                 let tag = std::str::from_utf8(local.as_ref()).unwrap_or("");
                 match tag {
                     "EventID" => in_event_id = true,
+                    "EventRecordID" => in_record_id = true,
                     "TimeCreated" => {
                         for attr in e.attributes().flatten() {
                             if attr.key.as_ref() == b"SystemTime" {
@@ -246,6 +281,8 @@ pub fn parse_event_xml(xml: &str) -> Option<EventRecord> {
                 let text = t.unescape().unwrap_or_default().to_string();
                 if in_event_id {
                     event_id = text.parse().unwrap_or(0);
+                } else if in_record_id {
+                    record_id = text.parse().unwrap_or(0);
                 } else if let Some(name) = &current_data_name {
                     match name.as_str() {
                         "FilterRTID" => filter_rtid = text.parse().ok(),
@@ -263,10 +300,11 @@ pub fn parse_event_xml(xml: &str) -> Option<EventRecord> {
             Ok(Event::End(e)) => {
                 let local = e.local_name();
                 let tag = std::str::from_utf8(local.as_ref()).unwrap_or("");
-                if tag == "EventID" {
-                    in_event_id = false;
-                } else if tag == "Data" {
-                    current_data_name = None;
+                match tag {
+                    "EventID" => in_event_id = false,
+                    "EventRecordID" => in_record_id = false,
+                    "Data" => current_data_name = None,
+                    _ => {}
                 }
             }
             Ok(Event::Eof) => break,
@@ -282,6 +320,7 @@ pub fn parse_event_xml(xml: &str) -> Option<EventRecord> {
     }
     Some(EventRecord {
         event_id,
+        record_id,
         time_created,
         filter_rtid,
         application,
@@ -292,18 +331,6 @@ pub fn parse_event_xml(xml: &str) -> Option<EventRecord> {
         source_address,
         source_port,
     })
-}
-
-#[allow(dead_code)]
-pub fn protocol_name(proto: u32) -> &'static str {
-    match proto {
-        1 => "ICMP",
-        2 => "IGMP",
-        6 => "TCP",
-        17 => "UDP",
-        58 => "ICMPv6",
-        _ => "other",
-    }
 }
 
 #[cfg(test)]
@@ -327,14 +354,30 @@ mod tests {
 <Data Name='RemoteUserID'>S-1-0-0</Data><Data Name='RemoteMachineID'>S-1-0-0</Data></EventData></Event>"#;
 
     #[test]
-    fn parses_5156() {
+    fn parses_5156_fields() {
         let ev = parse_event_xml(SAMPLE).expect("should parse");
         assert_eq!(ev.event_id, 5156);
+        assert_eq!(ev.record_id, 12345);
         assert_eq!(ev.filter_rtid, 67321);
         assert_eq!(ev.direction, "Outbound");
         assert_eq!(ev.protocol, 6);
         assert_eq!(ev.dest_port, "443");
         assert!(ev.application.ends_with("svchost.exe"));
         assert!(ev.is_allow());
+    }
+
+    #[test]
+    fn extracts_record_id_from_any_event_xml() {
+        assert_eq!(parse_record_id(SAMPLE), Some(12345));
+        assert_eq!(parse_record_id("<Event><System></System></Event>"), None);
+    }
+
+    #[test]
+    fn query_uses_strictly_greater_integer_cursor() {
+        assert_eq!(
+            build_query(Some(42)),
+            "*[System[(EventID=5156 or EventID=5157) and EventRecordID > 42]]"
+        );
+        assert!(!build_query(None).contains("EventRecordID"));
     }
 }

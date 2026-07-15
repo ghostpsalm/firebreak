@@ -115,13 +115,16 @@ impl Store {
         Ok(())
     }
 
-    /// Last-processed-event checkpoint, ISO8601 UTC.
-    pub fn checkpoint(&self) -> Result<Option<String>> {
-        self.get_meta("checkpoint")
+    /// Last-processed EventRecordID (Security channel). The next ingest
+    /// resumes strictly after this record.
+    pub fn checkpoint_record_id(&self) -> Result<Option<u64>> {
+        Ok(self
+            .get_meta("checkpoint_record_id")?
+            .and_then(|v| v.parse().ok()))
     }
 
-    pub fn set_checkpoint(&self, iso: &str) -> Result<()> {
-        self.set_meta("checkpoint", iso)
+    pub fn set_checkpoint_record_id(&self, id: u64) -> Result<()> {
+        self.set_meta("checkpoint_record_id", &id.to_string())
     }
 
     // ---- ingestion ----

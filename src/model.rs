@@ -43,6 +43,8 @@ impl RuleInfo {
 #[allow(dead_code)]
 pub struct EventRecord {
     pub event_id: u32,
+    /// EventRecordID: monotonic per-channel cursor, the ingestion checkpoint
+    pub record_id: u64,
     /// ISO8601 UTC
     pub time_created: String,
     pub filter_rtid: u64,

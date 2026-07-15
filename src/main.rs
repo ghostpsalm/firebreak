@@ -10,7 +10,7 @@ mod store;
 mod ui;
 
 use anyhow::{bail, Context, Result};
-use chrono::{DateTime, Duration, Utc};
+use chrono::Utc;
 use std::collections::BTreeSet;
 
 use filter_map::MappedVia;
@@ -115,8 +115,12 @@ fn main() -> Result<()> {
         if store.get_meta("collection_started")?.is_none() {
             store.set_meta("collection_started", &now)?;
         }
-        if store.checkpoint()?.is_none() {
-            store.set_checkpoint(&now)?;
+        if store.checkpoint_record_id()?.is_none() {
+            // start the cursor at the newest existing record so pre-enable
+            // history (from any earlier auditing period) isn't swept in;
+            // that adoption path is the explicit no-checkpoint mode below
+            let start = event_query::newest_record_id()?.unwrap_or(0);
+            store.set_checkpoint_record_id(start)?;
         }
         // snapshot the rule set as it stood when the clock started
         match firewall_rules::enumerate_rules() {
@@ -133,7 +137,7 @@ fn main() -> Result<()> {
         );
         note = "Collection just started — usage data will be empty until traffic accumulates."
             .to_string();
-    } else if store.checkpoint()?.is_none() {
+    } else if store.checkpoint_record_id()?.is_none() {
         // auditing was already on (GPO or manual) before this tool first ran:
         // adopt whatever history the log still holds
         println!("Auditing already enabled but no local checkpoint — ingesting available history.");
@@ -151,18 +155,21 @@ fn main() -> Result<()> {
     }
 
     // ---- ingest ----
-    let checkpoint = store.checkpoint()?;
+    let checkpoint = store.checkpoint_record_id()?;
     let rules = firewall_rules::enumerate_rules().context("enumerating firewall rules")?;
     let now = now_iso();
     store.snapshot_rules(&rules, &now)?;
 
-    // rollover check: if the oldest surviving event is newer than our
-    // checkpoint, a window of data was lost to log rotation
-    if let (Some(cp), Ok(Some(oldest))) = (&checkpoint, event_query::first_event_time()) {
-        if oldest.as_str() > cp.as_str() {
+    // coverage-gap check: if the channel's oldest surviving record is past
+    // our checkpoint, records in between are gone (log rollover / cleared
+    // log). Worded as a gap, not asserted as rollover — an auditing-off
+    // period looks identical from here.
+    if let (Some(cp), Ok(Some(oldest))) = (checkpoint, event_query::oldest_record_id()) {
+        if oldest > cp + 1 {
             note = format!(
-                "Security log rolled over: events between {cp} and {oldest} were lost. \
-                 Consider a larger log or more frequent runs. {note}"
+                "Possible coverage gap: the Security log's oldest surviving record ({oldest}) \
+                 is past the last checkpoint ({cp}) — log rollover, a cleared log, or a period \
+                 with auditing disabled. Consider a larger log or more frequent runs. {note}"
             );
         }
     }
@@ -186,16 +193,16 @@ fn main() -> Result<()> {
     let device_map = app_identity::device_path_map();
     let mut events_processed: u64 = 0;
     let mut unmatched_events: u64 = 0;
-    let mut max_time: Option<String> = None;
+    let mut max_record_id: Option<u64> = None;
     let mut errors: u64 = 0;
     // filter IDs repeat heavily across events; cache DB lookups for the run
     let mut historical_memo: std::collections::HashMap<u64, Option<String>> =
         std::collections::HashMap::new();
 
-    let ingest = event_query::query_events(checkpoint.as_deref(), |ev| {
+    let ingest = event_query::query_events(checkpoint, |ev| {
         events_processed += 1;
-        if max_time.as_deref().map_or(true, |m| ev.time_created.as_str() > m) {
-            max_time = Some(ev.time_created.clone());
+        if max_record_id.map_or(true, |m| ev.record_id > m) {
+            max_record_id = Some(ev.record_id);
         }
         let rule_id = match rule_map.get(&ev.filter_rtid) {
             Some((id, _)) => id.clone(),
@@ -226,19 +233,15 @@ fn main() -> Result<()> {
         eprintln!("warning: {errors} events failed to record");
     }
 
-    // advance checkpoint just past the newest event seen, so it isn't
-    // double-counted next run (event log XPath only offers >=)
-    if let Some(mt) = &max_time {
-        let next = DateTime::parse_from_rfc3339(mt)
-            .map(|t| {
-                (t.with_timezone(&Utc) + Duration::milliseconds(1))
-                    .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-                    .to_string()
-            })
-            .unwrap_or_else(|_| now.clone());
-        store.set_checkpoint(&next)?;
+    // advance the cursor to the newest record processed; the query resumes
+    // strictly after it, so nothing is re-read or skipped
+    if let Some(id) = max_record_id {
+        store.set_checkpoint_record_id(id)?;
     } else if checkpoint.is_none() {
-        store.set_checkpoint(&now)?;
+        // no matching events at all: anchor at the channel tail so a later
+        // run doesn't rescan the whole log
+        let start = event_query::newest_record_id()?.unwrap_or(0);
+        store.set_checkpoint_record_id(start)?;
     }
     store.set_meta("last_ingest", &now)?;
     store.commit()?;
