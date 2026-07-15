@@ -169,6 +169,12 @@ fn main() -> Result<()> {
 
     let filters = filter_map::enumerate_filters().context("enumerating WFP filters")?;
     let rule_map = filter_map::build_filter_rule_map(&filters, &rules);
+
+    // everything from here to the checkpoint advance is one transaction:
+    // a crash rolls back cleanly and a rerun re-ingests from the old
+    // checkpoint without double-counting
+    store.begin()?;
+
     for f in &filters {
         let (rule_id, via) = match rule_map.get(&f.filter_id) {
             Some((id, via)) => (Some(id.as_str()), via.as_str()),
@@ -182,28 +188,39 @@ fn main() -> Result<()> {
     let mut unmatched_events: u64 = 0;
     let mut max_time: Option<String> = None;
     let mut errors: u64 = 0;
+    // filter IDs repeat heavily across events; cache DB lookups for the run
+    let mut historical_memo: std::collections::HashMap<u64, Option<String>> =
+        std::collections::HashMap::new();
 
-    event_query::query_events(checkpoint.as_deref(), |ev| {
+    let ingest = event_query::query_events(checkpoint.as_deref(), |ev| {
         events_processed += 1;
         if max_time.as_deref().map_or(true, |m| ev.time_created.as_str() > m) {
             max_time = Some(ev.time_created.clone());
         }
         let rule_id = match rule_map.get(&ev.filter_rtid) {
             Some((id, _)) => id.clone(),
-            None => match store.historical_filter_rule(ev.filter_rtid) {
-                Ok(Some(id)) => id,
-                _ => {
-                    unmatched_events += 1;
-                    format!("unmatched:{}", ev.filter_rtid)
+            None => {
+                let cached = historical_memo.entry(ev.filter_rtid).or_insert_with(|| {
+                    store.historical_filter_rule(ev.filter_rtid).ok().flatten()
+                });
+                match cached {
+                    Some(id) => id.clone(),
+                    None => {
+                        unmatched_events += 1;
+                        format!("unmatched:{}", ev.filter_rtid)
+                    }
                 }
-            },
+            }
         };
         let app = app_identity::normalize_path(&ev.application, &device_map);
         if store.record_event(&rule_id, &ev, &app).is_err() {
             errors += 1;
         }
-    })
-    .context("querying Security log")?;
+    });
+    if let Err(e) = ingest {
+        let _ = store.rollback();
+        return Err(e).context("querying Security log");
+    }
 
     if errors > 0 {
         eprintln!("warning: {errors} events failed to record");
@@ -224,6 +241,7 @@ fn main() -> Result<()> {
         store.set_checkpoint(&now)?;
     }
     store.set_meta("last_ingest", &now)?;
+    store.commit()?;
 
     println!(
         "Ingested {events_processed} events ({unmatched_events} unattributed to a rule)."

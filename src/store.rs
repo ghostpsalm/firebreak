@@ -74,10 +74,31 @@ impl Store {
         Ok(Store { conn })
     }
 
+    // ---- transactions ----
+    // Ingestion runs as one transaction: aggregation and the checkpoint
+    // advance commit together, so a crash mid-ingest rolls back cleanly and
+    // a rerun cannot double-count. Also ~10^4x fewer WAL commits than
+    // per-event autocommit.
+
+    pub fn begin(&self) -> Result<()> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        Ok(())
+    }
+
+    pub fn commit(&self) -> Result<()> {
+        self.conn.execute_batch("COMMIT")?;
+        Ok(())
+    }
+
+    pub fn rollback(&self) -> Result<()> {
+        self.conn.execute_batch("ROLLBACK")?;
+        Ok(())
+    }
+
     // ---- meta / checkpoint ----
 
     pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
-        let mut stmt = self.conn.prepare("SELECT value FROM meta WHERE key = ?1")?;
+        let mut stmt = self.conn.prepare_cached("SELECT value FROM meta WHERE key = ?1")?;
         let mut rows = stmt.query(params![key])?;
         Ok(match rows.next()? {
             Some(row) => Some(row.get(0)?),
@@ -86,11 +107,11 @@ impl Store {
     }
 
     pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
-        self.conn.execute(
+        let mut stmt = self.conn.prepare_cached(
             "INSERT INTO meta (key, value) VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![key, value],
         )?;
+        stmt.execute(params![key, value])?;
         Ok(())
     }
 
@@ -106,9 +127,11 @@ impl Store {
     // ---- ingestion ----
 
     /// Record one event against a resolved rule id (or unmatched pseudo-id).
+    /// Hot path — statements are cached, and the caller wraps the whole
+    /// ingestion in one transaction via begin()/commit().
     pub fn record_event(&self, rule_id: &str, ev: &EventRecord, app_normalized: &str) -> Result<()> {
         let (allow, block) = if ev.is_allow() { (1, 0) } else { (0, 1) };
-        self.conn.execute(
+        let mut stmt = self.conn.prepare_cached(
             "INSERT INTO rule_usage (rule_id, allow_count, block_count, first_seen, last_seen)
              VALUES (?1, ?2, ?3, ?4, ?4)
              ON CONFLICT(rule_id) DO UPDATE SET
@@ -116,16 +139,16 @@ impl Store {
                 block_count = block_count + ?3,
                 first_seen  = MIN(first_seen, ?4),
                 last_seen   = MAX(last_seen, ?4)",
-            params![rule_id, allow, block, ev.time_created],
         )?;
-        self.conn.execute(
+        stmt.execute(params![rule_id, allow, block, ev.time_created])?;
+        let mut stmt = self.conn.prepare_cached(
             "INSERT INTO rule_apps (rule_id, app_path, hits, last_seen)
              VALUES (?1, ?2, 1, ?3)
              ON CONFLICT(rule_id, app_path) DO UPDATE SET
                 hits = hits + 1,
                 last_seen = MAX(last_seen, ?3)",
-            params![rule_id, app_normalized, ev.time_created],
         )?;
+        stmt.execute(params![rule_id, app_normalized, ev.time_created])?;
         Ok(())
     }
 
@@ -137,7 +160,7 @@ impl Store {
         mapped_via: &str,
         now_iso: &str,
     ) -> Result<()> {
-        self.conn.execute(
+        let mut stmt = self.conn.prepare_cached(
             "INSERT INTO filter_map (filter_id, rule_id, filter_name, mapped_via, last_seen_at)
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(filter_id) DO UPDATE SET
@@ -145,8 +168,8 @@ impl Store {
                 filter_name = excluded.filter_name,
                 mapped_via = excluded.mapped_via,
                 last_seen_at = excluded.last_seen_at",
-            params![filter_id as i64, rule_id, filter_name, mapped_via, now_iso],
         )?;
+        stmt.execute(params![filter_id as i64, rule_id, filter_name, mapped_via, now_iso])?;
         Ok(())
     }
 
@@ -155,7 +178,7 @@ impl Store {
     pub fn historical_filter_rule(&self, filter_id: u64) -> Result<Option<String>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT rule_id FROM filter_map WHERE filter_id = ?1 AND rule_id IS NOT NULL")?;
+            .prepare_cached("SELECT rule_id FROM filter_map WHERE filter_id = ?1 AND rule_id IS NOT NULL")?;
         let mut rows = stmt.query(params![filter_id as i64])?;
         Ok(match rows.next()? {
             Some(row) => Some(row.get(0)?),
