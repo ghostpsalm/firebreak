@@ -7,13 +7,15 @@ unused rules can be disabled and used-but-broad rules can be security-vetted.
 It works by correlating Windows' own WFP audit events (Security log 5156
 allowed / 5157 blocked, which carry the application path and the WFP Filter
 Run-Time ID) against the live WFP filter table and `Get-NetFirewallRule`.
-See `ARCHITECTURE.md` for the full design and rationale.
+See `ARCHITECTURE.md` for the full design and rationale, and
+`CODE_REVIEW_2026-07-15.md` for the review this codebase was hardened
+against.
 
 ## Build
 
 Native on Windows: `cargo build --release`
 Cross from Linux: `cargo build --release --target x86_64-pc-windows-gnu`
-(needs `mingw64-gcc` and the rustup target).
+(needs `mingw64-gcc` and the rustup target). `cargo test` runs on either.
 
 ## Run
 
@@ -22,67 +24,104 @@ Run **elevated**. Modes are auto-detected:
 1. **First run (auditing off):** enables the "Filtering Platform Connection"
    audit subcategory (success+failure), grows the Security log to 512 MiB if
    smaller, snapshots the current rule set, and starts the collection clock.
-   There is no retroactive data — run this as early as possible, then come
-   back days/weeks later. Use `--enable-only` to do just this and exit.
+   The pre-existing audit state and log size are recorded first, so
+   `--restore-audit` can put the host back exactly as found. There is no
+   retroactive data — run this as early as possible, then come back
+   days/weeks later. Use `--enable-only` to do just this and exit (it exits
+   after confirming collection is on even if auditing was already enabled).
 2. **Auditing already on, first run of the tool:** ingests whatever history
    the Security log still holds.
-3. **Normal run:** ingests events since the last checkpoint, aggregates
-   per-rule usage into `%ProgramData%\firebreak\firebreak.db`, and opens the UI.
+3. **Normal run:** ingests events since the last checkpoint (tracked by
+   Security-channel EventRecordID — exact, no re-reads or drops), aggregates
+   per-rule usage into `%ProgramData%\firebreak\firebreak.db`, and opens the
+   UI. Ingestion is a single transaction: a crash rolls back cleanly and the
+   rerun cannot double-count.
 
 Flags: `--enable-only`, `--no-ui` (text report), `--dump-filters`
-(diagnostics, see below), `--db <path>`.
+(diagnostics, see below), `--restore-audit` (revert audit policy + log size
+to the recorded pre-firebreak state), `--ui-preview` (mock-data UI, no
+elevation needed), `--db <path>`.
 
 The UI lists every rule with allow/block hit counts, last-seen time, the
 applications observed hitting it (friendly names from PE version info), and
 static baseline flags (mDNS/SSDP/LLMNR/RDP/SMB/broad-allow…). Checkboxes set
-the intended enabled-state; **Apply** first writes a full policy backup to
+the intended enabled-state; **Apply** runs on a background thread: it first
+writes a full policy backup to
 `%ProgramData%\firebreak\backups\firewall-<stamp>.wfw` (restore with
 `netsh advfirewall import <file>`) plus a JSON rule dump, then commits via
-`Set-NetFirewallRule`.
+`Set-NetFirewallRule` in chunks of 100 (nothing is applied if the backup
+fails).
+
+## Attribution model (what makes the numbers trustworthy)
+
+- WFP filter run-time IDs are only valid within one boot session. firebreak
+  enumerates boot times from the System log (event 6005) and resolves each
+  event against the filter map of *its own* session: the live WFP
+  enumeration for current-boot events, per-session mappings recorded by
+  earlier runs for older ones. Events from a boot during which the tool
+  never ran are reported as unattributed rather than guessed.
+- Filter→rule matching uses anchored tokens from the filter's providerData
+  (exact InstanceID equality, never substring), falling back to display-name
+  equality only when the display name is unambiguous.
+- **Unattributed events** are normal in moderation: WFP has built-in/default
+  filters that aren't firewall rules. Running the tool at least once per
+  boot session keeps attribution tight.
+- Local audit policy can be reverted by **Group Policy** refresh. If event
+  ingestion drops to zero unexpectedly:
+  `auditpol /get /subcategory:{0CCE9226-69AE-11D9-BED3-505054503030}`
+
+## Security posture
+
+- Data directory (`%ProgramData%\firebreak`) is created with an explicit
+  SYSTEM+Administrators-only DACL; a pre-existing directory is refused
+  unless owned by SYSTEM/Administrators (defeats pre-creation tampering
+  with the DB/backups an admin acts on).
+- All spawned system tools (powershell, netsh, auditpol, wevtutil) are
+  invoked by absolute `%SystemRoot%\System32` path, never PATH search.
+- All SQL is parameterized; PowerShell scripts go via `-EncodedCommand`
+  with proper quote escaping.
 
 ## Interpreting results
 
 - **Zero-hit enabled rules** are disable candidates — but only after the
   collection window has covered weekly/monthly-cadence activity (backup
   agents, license checks). Check "Collecting since" in the header.
-- **Unattributed events** are normal in moderation: WFP has built-in/default
-  filters that aren't firewall rules, and events recorded during a previous
-  boot session reference filter IDs that no longer exist (filter run-time
-  IDs regenerate at boot). The tool persists filter→rule mappings per run to
-  partially cover past boots — running it at least once per boot session
-  keeps attribution tight.
-- Local audit policy can be reverted by **Group Policy** refresh. If event
-  ingestion drops to zero unexpectedly:
-  `auditpol /get /subcategory:{0CCE9226-69AE-11D9-BED3-505054503030}`
+- A **coverage-gap warning** means the log's oldest surviving record is past
+  the checkpoint: log rollover, a cleared log, or a period with auditing
+  disabled. Zero-hit conclusions are weaker across such a gap.
 
 ## Verification checklist (built blind — confirm on a real box)
 
-This was written without access to a Windows host. Functionally everything
-compiles and the event parser has test coverage, but the following are from
-documentation/memory and are the first things to verify; all are cheap to
-adjust:
+This was written without access to a Windows host. All logic that can run
+cross-platform is unit-tested (22 tests), but the following Windows-side
+behaviors are from documentation/memory and are the first things to verify:
 
 1. **Filter→rule mapping (the load-bearing one).** Run `firebreak
    --dump-filters`, take a `FilterRTID` from a real 5156 event (Event
    Viewer → Security), and check what the matching filter's
-   `provider_data_utf16` actually contains. Matching currently tries
-   (a) providerData containing the rule's unique Name/InstanceID, then
-   (b) filter display-name == rule DisplayName (only when unambiguous).
-   If providerData turns out to hold something else, adjust
-   `build_filter_rule_map` in `src/filter_map.rs`.
+   `provider_data_utf16` actually contains. Matching tries (a) anchored
+   providerData tokens equal to a rule's unique Name/InstanceID, then
+   (b) filter display-name == rule DisplayName (only when unambiguous). If
+   real providerData tokens have a different shape, adjust
+   `candidate_tokens`/`build_filter_rule_map` in `src/filter_map.rs`.
 2. **Direction tokens**: `%%14592`=Inbound / `%%14593`=Outbound assumed
    (`decode_direction` in `src/event_query.rs`). Unrecognized tokens pass
    through raw, so a mistake is visible, not silent.
-3. **auditpol by GUID**: `auditpol /set
-   /subcategory:{0CCE9226-69AE-11D9-BED3-505054503030} /success:enable
-   /failure:enable` — GUID form used to dodge localized names; confirm the
-   braces/quoting survive as-is.
-4. **wevtutil maxSize parsing** (`security_log_max_bytes`): expects a
+3. **Boot markers**: System log event 6005 with provider name `EventLog` is
+   used to delimit boot sessions (`boot_times`). If none are found the tool
+   warns and treats everything as the current boot.
+4. **auditpol by GUID**: subcategory
+   `{0CCE9226-69AE-11D9-BED3-505054503030}` — GUID form used to dodge
+   localized names; confirm the braces survive as-is.
+5. **wevtutil maxSize parsing** (`security_log_max_bytes`): expects a
    `maxSize: <n>` line from `wevtutil gl Security`.
-5. **PowerShell JSON shape** (`enumerate_rules`): `Get-NetFirewallRule`
+6. **PowerShell JSON shape** (`enumerate_rules`): `Get-NetFirewallRule`
    joined with `-All` application/port filters by InstanceID; check the
    port/program columns populate for a few known rules.
-6. **First run end-to-end**: enable → generate traffic (browse somewhere) →
+7. **Secured directory creation** (`secure_dir.rs`): confirm first elevated
+   run creates `%ProgramData%\firebreak` owned by Administrators and that a
+   directory pre-created by a non-admin user is refused.
+8. **First run end-to-end**: enable → generate traffic (browse somewhere) →
    rerun → the browser's rule shows hits with the right app name.
 
 ## What this tool deliberately is not
