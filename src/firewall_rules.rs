@@ -18,7 +18,7 @@ fn run_powershell(script: &str) -> Result<String> {
         .flat_map(|u| u.to_le_bytes())
         .collect();
     let encoded = base64::engine::general_purpose::STANDARD.encode(utf16);
-    let out = Command::new("powershell")
+    let out = Command::new(crate::syspath::powershell())
         .args([
             "-NoProfile",
             "-NonInteractive",
@@ -95,7 +95,7 @@ pub fn backup_policy(rules: &[RuleInfo]) -> Result<PathBuf> {
     let wfw = dir.join(format!("firewall-{stamp}.wfw"));
     let json = dir.join(format!("rules-{stamp}.json"));
 
-    let out = Command::new("netsh")
+    let out = Command::new(crate::syspath::system32_tool("netsh.exe"))
         .args(["advfirewall", "export", &wfw.to_string_lossy()])
         .output()
         .context("running netsh advfirewall export")?;

@@ -68,7 +68,7 @@ pub fn query_audit_state() -> Result<AuditState> {
 /// Note: local audit policy can be overridden by GPO on the next policy
 /// refresh — if this flips back off between runs, that's the place to look.
 pub fn enable_auditing() -> Result<()> {
-    let out = Command::new("auditpol")
+    let out = Command::new(crate::syspath::system32_tool("auditpol.exe"))
         .args([
             "/set",
             &format!("/subcategory:{}", FILTERING_PLATFORM_CONNECTION_GUID),
@@ -89,7 +89,7 @@ pub fn enable_auditing() -> Result<()> {
 
 /// Current max size of the Security log in bytes, via wevtutil gl.
 pub fn security_log_max_bytes() -> Result<u64> {
-    let out = Command::new("wevtutil")
+    let out = Command::new(crate::syspath::system32_tool("wevtutil.exe"))
         .args(["gl", "Security"])
         .output()
         .context("running wevtutil gl Security")?;
@@ -114,7 +114,7 @@ pub fn ensure_security_log_size(min_bytes: u64) -> Result<bool> {
     if current >= min_bytes {
         return Ok(false);
     }
-    let out = Command::new("wevtutil")
+    let out = Command::new(crate::syspath::system32_tool("wevtutil.exe"))
         .args(["sl", "Security", &format!("/ms:{}", min_bytes)])
         .output()
         .context("running wevtutil sl Security")?;

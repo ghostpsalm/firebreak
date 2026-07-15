@@ -8,6 +8,7 @@ mod firewall_rules;
 mod model;
 mod secure_dir;
 mod store;
+mod syspath;
 mod ui;
 
 use anyhow::{bail, Context, Result};
