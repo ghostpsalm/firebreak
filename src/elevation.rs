@@ -3,7 +3,7 @@
 
 #[cfg(windows)]
 pub fn is_elevated() -> bool {
-    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::Security::{
         GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
     };
@@ -23,6 +23,7 @@ pub fn is_elevated() -> bool {
             std::mem::size_of::<TOKEN_ELEVATION>() as u32,
             &mut len,
         );
+        let _ = CloseHandle(token);
         ok.is_ok() && elevation.TokenIsElevated != 0
     }
 }

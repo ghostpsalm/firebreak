@@ -4,9 +4,18 @@
 
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
+use std::sync::mpsc::{Receiver, TryRecvError};
 
 use crate::firewall_rules;
 use crate::model::{BaselineFlag, RuleInfo, RuleUsage};
+
+/// Result of a backup+apply run on the worker thread.
+struct ApplyOutcome {
+    status: String,
+    /// names actually applied (used to update row state); empty on failure
+    disabled: Vec<String>,
+    enabled: Vec<String>,
+}
 
 pub struct RuleRow {
     pub rule: RuleInfo,
@@ -52,6 +61,9 @@ pub struct App {
     sort_asc: bool,
     confirm_open: bool,
     status: String,
+    /// present while a backup+apply runs on a worker thread — the UI stays
+    /// responsive and Apply is disabled until the outcome arrives
+    applying: Option<Receiver<ApplyOutcome>>,
 }
 
 impl App {
@@ -67,6 +79,7 @@ impl App {
             sort_asc: true, // zero-hit disable candidates first
             confirm_open: false,
             status: String::new(),
+            applying: None,
         }
     }
 
@@ -84,37 +97,79 @@ impl App {
         (to_disable, to_enable)
     }
 
-    fn apply_changes(&mut self) {
+    /// Kick off backup+apply on a worker thread; PowerShell/netsh take
+    /// seconds and must not freeze the frame loop.
+    fn start_apply(&mut self) {
         let (to_disable, to_enable) = self.pending_changes();
         let all_rules: Vec<RuleInfo> = self.rows.iter().map(|r| r.rule.clone()).collect();
-        match firewall_rules::backup_policy(&all_rules) {
-            Ok(path) => {
-                self.status = format!("Backup written to {}", path.display());
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.applying = Some(rx);
+        self.status = "Backing up and applying…".to_string();
+        std::thread::spawn(move || {
+            let backup_msg = match firewall_rules::backup_policy(&all_rules) {
+                Ok(path) => format!("Backup written to {}.", path.display()),
+                Err(e) => {
+                    let _ = tx.send(ApplyOutcome {
+                        status: format!("BACKUP FAILED, nothing applied: {e:#}"),
+                        disabled: Vec::new(),
+                        enabled: Vec::new(),
+                    });
+                    return;
+                }
+            };
+            let mut errors = Vec::new();
+            if let Err(e) = firewall_rules::set_rules_enabled(&to_disable, false) {
+                errors.push(format!("disable: {e:#}"));
             }
-            Err(e) => {
-                self.status = format!("BACKUP FAILED, nothing applied: {e:#}");
-                return;
+            if let Err(e) = firewall_rules::set_rules_enabled(&to_enable, true) {
+                errors.push(format!("enable: {e:#}"));
             }
-        }
-        let mut errors = Vec::new();
-        if let Err(e) = firewall_rules::set_rules_enabled(&to_disable, false) {
-            errors.push(format!("disable: {e:#}"));
-        }
-        if let Err(e) = firewall_rules::set_rules_enabled(&to_enable, true) {
-            errors.push(format!("enable: {e:#}"));
-        }
-        if errors.is_empty() {
-            for r in &mut self.rows {
-                r.rule.enabled = if r.target_enabled { "True" } else { "False" }.to_string();
+            let outcome = if errors.is_empty() {
+                ApplyOutcome {
+                    status: format!(
+                        "{backup_msg} Applied: {} disabled, {} enabled.",
+                        to_disable.len(),
+                        to_enable.len()
+                    ),
+                    disabled: to_disable,
+                    enabled: to_enable,
+                }
+            } else {
+                // set_rules_enabled reports partial progress in its error;
+                // rows are not updated so the UI still shows pre-apply state
+                ApplyOutcome {
+                    status: format!("{backup_msg} PARTIAL/FAILED apply: {}", errors.join("; ")),
+                    disabled: Vec::new(),
+                    enabled: Vec::new(),
+                }
+            };
+            let _ = tx.send(outcome);
+        });
+    }
+
+    fn poll_apply(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = &self.applying {
+            match rx.try_recv() {
+                Ok(outcome) => {
+                    for r in &mut self.rows {
+                        if outcome.disabled.contains(&r.rule.name) {
+                            r.rule.enabled = "False".to_string();
+                        } else if outcome.enabled.contains(&r.rule.name) {
+                            r.rule.enabled = "True".to_string();
+                        }
+                    }
+                    self.status = outcome.status;
+                    self.applying = None;
+                }
+                Err(TryRecvError::Empty) => {
+                    // keep painting while the worker runs
+                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.status = "Apply worker terminated unexpectedly.".to_string();
+                    self.applying = None;
+                }
             }
-            self.status = format!(
-                "{} Applied: {} disabled, {} enabled.",
-                self.status,
-                to_disable.len(),
-                to_enable.len()
-            );
-        } else {
-            self.status = format!("{} PARTIAL/FAILED apply: {}", self.status, errors.join("; "));
         }
     }
 
@@ -172,6 +227,7 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_apply(ctx);
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
             ui.heading("Windows Firewall Rule-Usage Audit");
             ui.horizontal_wrapped(|ui| {
@@ -220,12 +276,16 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 let pending = to_disable.len() + to_enable.len();
                 let btn = ui.add_enabled(
-                    pending > 0,
-                    egui::Button::new(format!(
-                        "Apply changes ({} disable, {} enable)…",
-                        to_disable.len(),
-                        to_enable.len()
-                    )),
+                    pending > 0 && self.applying.is_none(),
+                    egui::Button::new(if self.applying.is_some() {
+                        "Applying…".to_string()
+                    } else {
+                        format!(
+                            "Apply changes ({} disable, {} enable)…",
+                            to_disable.len(),
+                            to_enable.len()
+                        )
+                    }),
                 );
                 if btn.clicked() {
                     self.confirm_open = true;
@@ -273,7 +333,7 @@ impl eframe::App for App {
                             .clicked()
                         {
                             self.confirm_open = false;
-                            self.apply_changes();
+                            self.start_apply();
                         }
                     });
                 });
