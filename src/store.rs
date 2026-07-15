@@ -33,8 +33,8 @@ impl Store {
             );
 
             -- rolled-up usage per rule; rule_id is the firewall rule Name
-            -- (InstanceID), or 'unmatched:<boot_session>:<filter_id>' for
-            -- events whose filter never resolved to a rule
+            -- (InstanceID), a 'disp:<name>|<dir>' group key, or a
+            -- 'default:<FilterOrigin>' system-filter bucket
             CREATE TABLE IF NOT EXISTS rule_usage (
                 rule_id     TEXT PRIMARY KEY,
                 allow_count INTEGER NOT NULL DEFAULT 0,
@@ -183,54 +183,6 @@ impl Store {
         Ok(())
     }
 
-    /// COALESCE keeps an earlier same-session mapping alive if the filter
-    /// has since been deleted (rule removed mid-boot): a currently-unmatched
-    /// re-sighting must not NULL out the mapping older events still need.
-    pub fn upsert_filter_mapping(
-        &self,
-        filter_id: u64,
-        boot_session: &str,
-        rule_id: Option<&str>,
-        filter_name: &str,
-        mapped_via: &str,
-        now_iso: &str,
-    ) -> Result<()> {
-        let mut stmt = self.conn.prepare_cached(
-            "INSERT INTO filter_map (filter_id, boot_session, rule_id, filter_name, mapped_via, last_seen_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(filter_id, boot_session) DO UPDATE SET
-                rule_id = COALESCE(excluded.rule_id, rule_id),
-                filter_name = excluded.filter_name,
-                mapped_via = CASE WHEN excluded.rule_id IS NULL AND rule_id IS NOT NULL
-                                  THEN mapped_via ELSE excluded.mapped_via END,
-                last_seen_at = excluded.last_seen_at",
-        )?;
-        stmt.execute(params![
-            filter_id as i64,
-            boot_session,
-            rule_id,
-            filter_name,
-            mapped_via,
-            now_iso
-        ])?;
-        Ok(())
-    }
-
-    /// Look up a recorded mapping for a filter id within a specific boot
-    /// session — used for events from sessions other than the current one,
-    /// and for current-session filters that no longer exist.
-    pub fn historical_filter_rule(&self, filter_id: u64, boot_session: &str) -> Result<Option<String>> {
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT rule_id FROM filter_map
-             WHERE filter_id = ?1 AND boot_session = ?2 AND rule_id IS NOT NULL",
-        )?;
-        let mut rows = stmt.query(params![filter_id as i64, boot_session])?;
-        Ok(match rows.next()? {
-            Some(row) => Some(row.get(0)?),
-            None => None,
-        })
-    }
-
     /// Keeps only the first snapshot (the rule set as it stood when
     /// collection started) and the latest — enough to answer "what changed
     /// since the audit began" without growing the DB on every run.
@@ -337,39 +289,38 @@ impl Store {
         Ok(Some(usage))
     }
 
-    /// filter (id, boot_session) -> recorded WFP filter display name, for
-    /// explaining unattributed events (most are WFP default/built-in
-    /// filters whose names say so, e.g. "Default Outbound Block").
-    pub fn filter_names(&self) -> Result<std::collections::HashMap<(u64, String), String>> {
-        let mut map = std::collections::HashMap::new();
-        let mut stmt = self.conn.prepare(
-            "SELECT filter_id, boot_session, filter_name FROM filter_map
-             WHERE filter_name IS NOT NULL AND filter_name != ''",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)? as u64,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })?;
-        for r in rows {
-            let (id, session, name) = r?;
-            map.insert((id, session), name);
-        }
-        Ok(map)
-    }
-
-    /// All usage rows whose rule_id starts with 'unmatched:' — events we
-    /// could not attribute to any firewall rule — most hits first.
+    /// All usage rows whose rule_id starts with 'default:' — events decided
+    /// by a default/system WFP filter rather than a firewall rule, keyed by
+    /// FilterOrigin. Most hits first.
     pub fn unmatched_usage(&self) -> Result<Vec<RuleUsage>> {
         let mut out: Vec<RuleUsage> = self
             .all_usage()?
             .into_values()
-            .filter(|u| u.rule_id.starts_with("unmatched:"))
+            .filter(|u| u.rule_id.starts_with("default:"))
             .collect();
         out.sort_by_key(|u| -(u.allow_count + u.block_count));
         Ok(out)
+    }
+
+    pub fn set_bucket_label(&self, bucket_id: &str, label: &str) -> Result<()> {
+        self.set_meta(&format!("bucketlabel:{bucket_id}"), label)
+    }
+
+    pub fn bucket_labels(&self) -> Result<std::collections::HashMap<String, String>> {
+        let mut map = std::collections::HashMap::new();
+        let mut stmt = self
+            .conn
+            .prepare("SELECT key, value FROM meta WHERE key LIKE 'bucketlabel:%'")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for r in rows {
+            let (k, v) = r?;
+            if let Some(id) = k.strip_prefix("bucketlabel:") {
+                map.insert(id.to_string(), v);
+            }
+        }
+        Ok(map)
     }
 }
 
@@ -447,29 +398,11 @@ mod tests {
     }
 
     #[test]
-    fn unmatched_resighting_does_not_clobber_mapping() {
-        // regression for C-05
-        let t = TempStore::new("coalesce");
-        t.store
-            .upsert_filter_mapping(9, "boot-a", Some("rule-x"), "f", "provider_data", "t1")
-            .unwrap();
-        t.store
-            .upsert_filter_mapping(9, "boot-a", None, "f", "unmatched", "t2")
-            .unwrap();
-        assert_eq!(
-            t.store.historical_filter_rule(9, "boot-a").unwrap().as_deref(),
-            Some("rule-x")
-        );
-    }
-
-    #[test]
-    fn mappings_are_scoped_to_their_boot_session() {
-        // regression for C-01
-        let t = TempStore::new("boot");
-        t.store
-            .upsert_filter_mapping(9, "boot-a", Some("rule-x"), "f", "provider_data", "t1")
-            .unwrap();
-        assert_eq!(t.store.historical_filter_rule(9, "boot-b").unwrap(), None);
+    fn bucket_labels_round_trip() {
+        let t = TempStore::new("buckets");
+        t.store.set_bucket_label("default:Unknown", "Unknown").unwrap();
+        let m = t.store.bucket_labels().unwrap();
+        assert_eq!(m.get("default:Unknown").map(String::as_str), Some("Unknown"));
     }
 
     #[test]
@@ -502,12 +435,12 @@ mod tests {
     fn unmatched_usage_filters_and_sorts() {
         let t = TempStore::new("unmatched");
         t.store
-            .record_event("unmatched:boot-a:5", &ev(1, 5156, "2026-07-01T00:00:00Z", 5), "a")
+            .record_event("default:Unknown", &ev(1, 5156, "2026-07-01T00:00:00Z", 5), "a")
             .unwrap();
         for i in 0..3 {
             t.store
                 .record_event(
-                    "unmatched:boot-a:6",
+                    "default:Stealth",
                     &ev(2 + i, 5157, "2026-07-01T00:00:00Z", 6),
                     "b",
                 )
@@ -518,6 +451,6 @@ mod tests {
             .unwrap();
         let unmatched = t.store.unmatched_usage().unwrap();
         assert_eq!(unmatched.len(), 2);
-        assert_eq!(unmatched[0].rule_id, "unmatched:boot-a:6");
+        assert_eq!(unmatched[0].rule_id, "default:Stealth");
     }
 }

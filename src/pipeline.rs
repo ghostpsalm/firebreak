@@ -7,11 +7,10 @@ use chrono::Utc;
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use crate::filter_map::MappedVia;
 use crate::listeners::{self, Listener};
 use crate::model::RuleUsage;
 use crate::store::Store;
-use crate::{app_identity, audit_control, baseline_checks, event_query, filter_map, firewall_rules, ui};
+use crate::{app_identity, audit_control, baseline_checks, event_query, firewall_rules, ui};
 
 pub fn now_iso() -> String {
     Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
@@ -21,6 +20,40 @@ pub fn hostname() -> String {
     std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
         .unwrap_or_else(|_| "this host".to_string())
+}
+
+/// Group key for a rule's DisplayName + direction, shared by profile
+/// variants of the same rule. Used both when attributing a FilterOrigin
+/// that is a DisplayName and when looking a rule's usage back up.
+fn disp_key(display_name: &str, direction: &str) -> String {
+    let dir = if direction.eq_ignore_ascii_case("inbound") {
+        "in"
+    } else if direction.eq_ignore_ascii_case("outbound") {
+        "out"
+    } else {
+        "?"
+    };
+    format!("disp:{}|{}", display_name.to_lowercase(), dir)
+}
+
+/// Friendlier label for a default/system-filter FilterOrigin.
+fn describe_origin(origin: &str) -> String {
+    let lc = origin.to_lowercase();
+    if lc == "unknown" || lc.is_empty() {
+        "Unknown — decided by a default/system filter, not a firewall rule".into()
+    } else if lc.contains("default outbound") {
+        "Default outbound policy (allow) — no specific rule".into()
+    } else if lc.contains("default inbound") {
+        "Default inbound policy (block) — no specific rule".into()
+    } else if lc.contains("boot") {
+        format!("{origin} — boot-time default filter")
+    } else if lc.contains("stealth") {
+        format!("{origin} — stealth-mode default filter")
+    } else if lc.contains("appcontainer") || lc.contains("loopback") || lc.contains("quarantine") {
+        format!("{origin} — system filter (not a firewall rule)")
+    } else {
+        format!("{origin} — default/system filter")
+    }
 }
 
 /// One unattributed bucket, explained: which WFP filter the events matched
@@ -149,7 +182,7 @@ pub fn analyze(db_path: &Path, progress: &dyn Fn(&str)) -> Result<AnalysisResult
     }
 
     let checkpoint = store.checkpoint_record_id()?;
-    progress("Enumerating firewall rules…");
+    progress("Loading firewall rules…");
     let rules = firewall_rules::enumerate_rules().context("enumerating firewall rules")?;
     let now = now_iso();
     store.snapshot_rules(&rules, &now)?;
@@ -168,61 +201,40 @@ pub fn analyze(db_path: &Path, progress: &dyn Fn(&str)) -> Result<AnalysisResult
         }
     }
 
-    progress("Enumerating WFP filters…");
-    let filters = filter_map::enumerate_filters().context("enumerating WFP filters")?;
-    let rule_map = filter_map::build_filter_rule_map(&filters, &rules);
-
-    // WFP filter run-time IDs are only meaningful within one boot session:
-    // the same numeric ID can name a different filter after a reboot. Events
-    // are therefore resolved against the filter map of *their* session —
-    // current enumeration for current-boot events, recorded mappings for
-    // older ones — never across sessions.
-    let boots = event_query::boot_times().unwrap_or_default();
-    let current_boot = boots.last().cloned().unwrap_or_default();
-    if boots.is_empty() {
-        eprintln!(
-            "warning: no boot markers (System log 6005) found — treating all events as the \
-             current boot session; cross-boot attribution may be less precise"
-        );
-    }
-    // boot session of an event = latest boot start <= event time
-    let session_of = |ev_time: &str| -> String {
-        match boots.iter().rev().find(|b| b.as_str() <= ev_time) {
-            Some(b) => b.clone(),
-            None => current_boot.clone(),
-        }
-    };
-
-    // everything from here to the checkpoint advance is one transaction:
-    // a crash rolls back cleanly and a rerun re-ingests from the old
-    // checkpoint without double-counting
-    store.begin()?;
-
-    for f in &filters {
-        let (rule_id, via) = match rule_map.get(&f.filter_id) {
-            Some((id, via)) => (Some(id.as_str()), via.as_str()),
-            None => (None, MappedVia::Unmatched.as_str()),
-        };
-        store.upsert_filter_mapping(f.filter_id, &current_boot, rule_id, &f.name, via, &now)?;
-    }
-
-    progress("Ingesting Security log events…");
-    let device_map = app_identity::device_path_map();
-    // case-insensitive rule-name index for FilterOrigin attribution
-    let rule_names_ci: std::collections::HashMap<String, String> = rules
+    // Attribution model (see the on-device support export that established
+    // it): every 5156/5157 event on modern Windows carries a FilterOrigin
+    // string naming the deciding filter. For firewall-rule decisions that is
+    // the rule's DisplayName (or Name); for default/system filters it's a
+    // description like "Unknown", "AppContainer Loopback", "Default
+    // Outbound", "Stealth". We therefore attribute by FilterOrigin — no WFP
+    // filter enumeration, no per-boot filter run-time IDs (both proved
+    // useless: providerData holds an opaque numeric id, not the rule name).
+    //
+    // Match key precedence: exact rule Name (InstanceID) → (DisplayName,
+    // direction) group → default:<origin> bucket. Same-DisplayName profile
+    // variants share one "disp:" group key so a used rule credits all its
+    // profile variants without inflating counts.
+    let rule_by_name: std::collections::HashMap<String, String> = rules
         .iter()
         .map(|r| (r.name.to_lowercase(), r.name.clone()))
         .collect();
+    let display_dir_keys: std::collections::HashSet<String> = rules
+        .iter()
+        .map(|r| disp_key(&r.display_name, &r.direction))
+        .collect();
+
+    // everything from here to the checkpoint advance is one transaction:
+    // a crash rolls back cleanly and a rerun re-ingests without double-count
+    store.begin()?;
+
+    progress("Ingesting Security log events…");
+    let device_map = app_identity::device_path_map();
     let mut events_processed: u64 = 0;
     let mut unmatched_events: u64 = 0;
     let mut max_record_id: Option<u64> = None;
     let mut errors: u64 = 0;
-    // filter IDs repeat heavily across events; cache DB lookups for the run
-    let mut historical_memo: std::collections::HashMap<(u64, String), Option<String>> =
-        std::collections::HashMap::new();
-    // non-rule FilterOrigin values seen per unmatched bucket, to explain
-    // them in the report ("Stealth", "Query User Default", …)
-    let mut unmatched_origins: std::collections::HashMap<String, String> =
+    // human labels for the default/system buckets, keyed by their rule_id
+    let mut bucket_labels: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
 
     let ingest = event_query::query_events(checkpoint, |ev| {
@@ -230,45 +242,23 @@ pub fn analyze(db_path: &Path, progress: &dyn Fn(&str)) -> Result<AnalysisResult
         if max_record_id.map_or(true, |m| ev.record_id > m) {
             max_record_id = Some(ev.record_id);
         }
-        // most authoritative first: newer Windows builds put the rule ID
-        // (or a policy-origin token) straight into the event
-        let origin_hit = ev
-            .filter_origin
-            .as_ref()
-            .and_then(|o| rule_names_ci.get(&o.to_lowercase()).cloned());
-        let session = session_of(&ev.time_created);
-        // then the live enumeration for current-boot events; everything
-        // else (and live filters since deleted) via the per-session DB map
-        let current_hit = origin_hit.or_else(|| {
-            if session == current_boot {
-                rule_map.get(&ev.filter_rtid).map(|(id, _)| id.clone())
+        let origin = ev.filter_origin.as_deref().unwrap_or("Unknown").trim();
+        let origin_lc = origin.to_lowercase();
+        let rule_id = if let Some(name) = rule_by_name.get(&origin_lc) {
+            // FilterOrigin was the rule InstanceID
+            name.clone()
+        } else {
+            let dk = disp_key(origin, &ev.direction);
+            if display_dir_keys.contains(&dk) {
+                // FilterOrigin was the rule DisplayName (credits all profile
+                // variants of that name+direction)
+                dk
             } else {
-                None
-            }
-        });
-        let rule_id = match current_hit {
-            Some(id) => id,
-            None => {
-                let key = (ev.filter_rtid, session.clone());
-                let cached = historical_memo.entry(key).or_insert_with(|| {
-                    store
-                        .historical_filter_rule(ev.filter_rtid, &session)
-                        .ok()
-                        .flatten()
-                });
-                match cached {
-                    Some(id) => id.clone(),
-                    None => {
-                        unmatched_events += 1;
-                        let pseudo = format!("unmatched:{}:{}", session, ev.filter_rtid);
-                        if let Some(origin) = &ev.filter_origin {
-                            unmatched_origins
-                                .entry(pseudo.clone())
-                                .or_insert_with(|| origin.clone());
-                        }
-                        pseudo
-                    }
-                }
+                // default/system filter — not a firewall rule
+                unmatched_events += 1;
+                let bucket = format!("default:{}", if origin.is_empty() { "Unknown" } else { origin });
+                bucket_labels.entry(bucket.clone()).or_insert_with(|| origin.to_string());
+                bucket
             }
         };
         let app = app_identity::normalize_path(&ev.application, &device_map);
@@ -302,10 +292,15 @@ pub fn analyze(db_path: &Path, progress: &dyn Fn(&str)) -> Result<AnalysisResult
     let listener_list = listeners::enumerate_listeners().unwrap_or_default();
 
     progress("Building report…");
-    let mut all_usage = store.all_usage()?;
+    let all_usage = store.all_usage()?;
     let mut rows: Vec<ui::RuleRow> = Vec::new();
     for rule in rules {
-        let usage = all_usage.remove(&rule.name);
+        // usage by exact InstanceID, else by the DisplayName+direction group
+        // (profile variants share it)
+        let usage = all_usage
+            .get(&rule.name)
+            .or_else(|| all_usage.get(&disp_key(&rule.display_name, &rule.direction)))
+            .cloned();
         let flags = baseline_checks::flags_for(&rule);
         let seen_apps: Vec<String> = usage
             .as_ref()
@@ -334,34 +329,30 @@ pub fn analyze(db_path: &Path, progress: &dyn Fn(&str)) -> Result<AnalysisResult
         });
     }
 
-    let filter_names = store.filter_names().unwrap_or_default();
+    // default/system-filter buckets: "default:<origin>" rows in the store
+    let stored_labels = store.bucket_labels().unwrap_or_default();
     let unmatched = store
         .unmatched_usage()?
         .into_iter()
         .map(|usage| {
-            // rule_id shape: unmatched:<boot_session>:<filter_id>
-            let rest = usage.rule_id.strip_prefix("unmatched:").unwrap_or("");
-            let (session, fid) = rest.rsplit_once(':').unwrap_or(("", rest));
-            // best explanation available: the enumerated filter's name,
-            // else the event's own FilterOrigin token, else honesty
-            let filter_name = fid
-                .parse::<u64>()
-                .ok()
-                .and_then(|id| filter_names.get(&(id, session.to_string())).cloned())
-                .or_else(|| {
-                    unmatched_origins
-                        .get(&usage.rule_id)
-                        .map(|o| format!("origin: {o}"))
-                })
-                .unwrap_or_else(|| "(filter not recorded — likely from a boot with no firebreak run)".to_string());
+            let origin = usage.rule_id.strip_prefix("default:").unwrap_or(&usage.rule_id);
+            let label = bucket_labels
+                .get(&usage.rule_id)
+                .cloned()
+                .or_else(|| stored_labels.get(&usage.rule_id).cloned())
+                .unwrap_or_else(|| origin.to_string());
             UnmatchedRow {
-                filter_id: fid.to_string(),
-                boot_session: session.to_string(),
-                filter_name,
+                filter_id: String::new(),
+                boot_session: String::new(),
+                filter_name: describe_origin(&label),
                 usage,
             }
         })
         .collect();
+    // persist labels so they survive across runs
+    for (id, label) in &bucket_labels {
+        let _ = store.set_bucket_label(id, label);
+    }
 
     let ctx = ui::AuditContext {
         hostname: hostname(),

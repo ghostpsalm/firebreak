@@ -141,7 +141,6 @@ pub fn export(out_path: &Path) -> Result<()> {
         match via {
             MappedVia::ProviderData => via_pd += 1,
             MappedVia::DisplayName => via_name += 1,
-            MappedVia::Unmatched => {}
         }
     }
     let _ = writeln!(o, "filters mapped to a rule: {} of {}", rule_map.len(), filters.len());

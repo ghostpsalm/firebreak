@@ -125,7 +125,6 @@ fn decode_provider_data(data: &[u8]) -> (String, String) {
 pub enum MappedVia {
     ProviderData,
     DisplayName,
-    Unmatched,
 }
 
 impl MappedVia {
@@ -133,7 +132,6 @@ impl MappedVia {
         match self {
             MappedVia::ProviderData => "provider_data",
             MappedVia::DisplayName => "display_name",
-            MappedVia::Unmatched => "unmatched",
         }
     }
 }
