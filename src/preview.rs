@@ -58,13 +58,13 @@ pub fn run() -> Result<()> {
             vec!["Google Chrome (Google LLC)"],
         ),
         (
-            rule("{a3}", "Remote Desktop - User Mode (TCP-In)", true, "Inbound", "Allow", "Any",
+            rule("{a3}", "Remote Desktop - User Mode (TCP-In)", true, "Inbound", "Allow", "Domain",
                 Some("Remote Desktop"), None, Some("TCP"), Some("3389")),
             None,
             vec![],
         ),
         (
-            rule("{a4}", "File and Printer Sharing (SMB-In)", true, "Inbound", "Allow", "Private",
+            rule("{a4}", "File and Printer Sharing (SMB-In)", true, "Inbound", "Allow", "Domain, Private",
                 Some("File and Printer Sharing"), Some("System"), Some("TCP"), Some("445")),
             Some(usage("{a4}", 12, 0, "2026-07-09T10:03:19.000Z", &[("System", 12)])),
             vec!["System"],
@@ -110,6 +110,14 @@ pub fn run() -> Result<()> {
             vec![],
         ),
     ];
+
+    let mut specs = specs;
+    specs[0].0.description =
+        Some("Outbound rule to allow DNS requests. DNS responses based on requests that \
+              matched this rule will be permitted regardless of source address."
+            .into());
+    specs[2].0.description =
+        Some("Inbound rule for the Remote Desktop service to allow RDP traffic. [TCP 3389]".into());
 
     let rows = specs
         .into_iter()

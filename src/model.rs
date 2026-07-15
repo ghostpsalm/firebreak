@@ -35,6 +35,44 @@ impl RuleInfo {
     pub fn is_enabled(&self) -> bool {
         self.enabled.eq_ignore_ascii_case("true")
     }
+
+    /// Profile tags for display: ["Domain"], ["Private", "Public"], … or
+    /// ["Any"]. Unknown/NotApplicable values render as-is so nothing is
+    /// silently hidden.
+    pub fn profile_tags(&self) -> Vec<&'static str> {
+        let p = self.profile.to_lowercase();
+        if p.contains("any") {
+            return vec!["Any"];
+        }
+        let mut tags = Vec::new();
+        if p.contains("domain") {
+            tags.push("Domain");
+        }
+        if p.contains("private") {
+            tags.push("Private");
+        }
+        if p.contains("public") {
+            tags.push("Public");
+        }
+        tags
+    }
+
+    /// Whether this rule is active in at least one of the selected profiles.
+    /// "Any" (and unrecognized values like NotApplicable) match whenever at
+    /// least one profile is selected — filtering must never hide a rule
+    /// whose scope we couldn't parse.
+    pub fn applies_to_profile(&self, domain: bool, private: bool, public: bool) -> bool {
+        if !(domain || private || public) {
+            return false;
+        }
+        let tags = self.profile_tags();
+        if tags.is_empty() || tags == ["Any"] {
+            return true;
+        }
+        (domain && tags.contains(&"Domain"))
+            || (private && tags.contains(&"Private"))
+            || (public && tags.contains(&"Public"))
+    }
 }
 
 /// One parsed 5156/5157 event. Several fields aren't consumed by the
@@ -102,4 +140,51 @@ pub struct RuleUsage {
 pub struct BaselineFlag {
     pub title: &'static str,
     pub advice: &'static str,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rule_with_profile(profile: &str) -> RuleInfo {
+        RuleInfo {
+            name: "{id}".into(),
+            display_name: "r".into(),
+            description: None,
+            enabled: "True".into(),
+            direction: "Inbound".into(),
+            action: "Allow".into(),
+            profile: profile.into(),
+            group: None,
+            program: None,
+            protocol: None,
+            local_port: None,
+            remote_port: None,
+        }
+    }
+
+    #[test]
+    fn profile_tags_parse_combinations() {
+        assert_eq!(rule_with_profile("Any").profile_tags(), vec!["Any"]);
+        assert_eq!(
+            rule_with_profile("Domain, Public").profile_tags(),
+            vec!["Domain", "Public"]
+        );
+        assert_eq!(rule_with_profile("Private").profile_tags(), vec!["Private"]);
+    }
+
+    #[test]
+    fn profile_filter_matches_selected_sets() {
+        let dp = rule_with_profile("Domain, Private");
+        assert!(dp.applies_to_profile(true, false, false));
+        assert!(dp.applies_to_profile(false, true, false));
+        assert!(!dp.applies_to_profile(false, false, true));
+        // Any matches whenever something is selected, never when nothing is
+        let any = rule_with_profile("Any");
+        assert!(any.applies_to_profile(false, false, true));
+        assert!(!any.applies_to_profile(false, false, false));
+        // unparseable scope must stay visible rather than silently vanish
+        let odd = rule_with_profile("NotApplicable");
+        assert!(odd.applies_to_profile(true, false, false));
+    }
 }

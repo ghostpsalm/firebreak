@@ -57,6 +57,9 @@ pub struct App {
     only_enabled: bool,
     only_zero_hit: bool,
     only_flagged: bool,
+    show_domain: bool,
+    show_private: bool,
+    show_public: bool,
     sort: SortBy,
     sort_asc: bool,
     confirm_open: bool,
@@ -75,6 +78,9 @@ impl App {
             only_enabled: false,
             only_zero_hit: false,
             only_flagged: false,
+            show_domain: true,
+            show_private: true,
+            show_public: true,
             sort: SortBy::Hits,
             sort_asc: true, // zero-hit disable candidates first
             confirm_open: false,
@@ -187,6 +193,12 @@ impl App {
                 if self.only_flagged && r.flags.is_empty() {
                     return false;
                 }
+                if !r
+                    .rule
+                    .applies_to_profile(self.show_domain, self.show_private, self.show_public)
+                {
+                    return false;
+                }
                 if needle.is_empty() {
                     return true;
                 }
@@ -251,6 +263,14 @@ impl eframe::App for App {
                 ui.checkbox(&mut self.only_enabled, "enabled only");
                 ui.checkbox(&mut self.only_zero_hit, "zero-hit only");
                 ui.checkbox(&mut self.only_flagged, "flagged only");
+                ui.separator();
+                ui.label("Profiles:");
+                ui.checkbox(&mut self.show_domain, "Domain");
+                ui.checkbox(&mut self.show_private, "Private");
+                ui.checkbox(&mut self.show_public, "Public");
+                if !(self.show_domain || self.show_private || self.show_public) {
+                    ui.colored_label(egui::Color32::YELLOW, "(no profiles selected)");
+                }
                 ui.separator();
                 ui.label("Sort:");
                 if ui.selectable_label(matches!(self.sort, SortBy::Hits), "hits").clicked() {
@@ -347,7 +367,7 @@ impl eframe::App for App {
                 .column(Column::remainder().at_least(200.0)) // display name
                 .column(Column::exact(60.0))  // direction
                 .column(Column::exact(50.0))  // action
-                .column(Column::exact(80.0))  // profile
+                .column(Column::exact(130.0)) // profile tags
                 .column(Column::exact(90.0))  // hits allow/block
                 .column(Column::exact(140.0)) // last seen
                 .column(Column::remainder().at_least(160.0)) // apps seen
@@ -374,9 +394,16 @@ impl eframe::App for App {
                             }
                         });
                         table_row.col(|ui| {
+                            let description = row
+                                .rule
+                                .description
+                                .as_deref()
+                                .filter(|d| !d.trim().is_empty())
+                                .unwrap_or("(no description)");
                             ui.label(&row.rule.display_name)
                                 .on_hover_text(format!(
-                                    "{}\nGroup: {}\nProgram: {}\nPorts: {} local / {} remote ({})",
+                                    "{}\n\n{}\nGroup: {}\nProgram: {}\nPorts: {} local / {} remote ({})",
+                                    description,
                                     row.rule.name,
                                     row.rule.group.as_deref().unwrap_or("-"),
                                     row.rule.program.as_deref().unwrap_or("Any"),
@@ -392,7 +419,19 @@ impl eframe::App for App {
                             ui.label(&row.rule.action);
                         });
                         table_row.col(|ui| {
-                            ui.label(&row.rule.profile);
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 3.0;
+                                for tag in row.rule.profile_tags() {
+                                    let color = match tag {
+                                        "Domain" => egui::Color32::from_rgb(90, 140, 220),
+                                        "Private" => egui::Color32::from_rgb(90, 180, 110),
+                                        "Public" => egui::Color32::from_rgb(220, 140, 60),
+                                        _ => egui::Color32::GRAY, // Any / unparsed
+                                    };
+                                    ui.colored_label(color, tag)
+                                        .on_hover_text(format!("Raw profile: {}", row.rule.profile));
+                                }
+                            });
                         });
                         table_row.col(|ui| {
                             match &row.usage {
