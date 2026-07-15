@@ -18,8 +18,8 @@ pub fn default_db_path() -> PathBuf {
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)
-                .with_context(|| format!("creating {}", dir.display()))?;
+            crate::secure_dir::ensure_secured_dir(dir)
+                .with_context(|| format!("securing {}", dir.display()))?;
         }
         let conn = Connection::open(path)
             .with_context(|| format!("opening db {}", path.display()))?;

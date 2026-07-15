@@ -6,6 +6,7 @@ mod event_query;
 mod filter_map;
 mod firewall_rules;
 mod model;
+mod secure_dir;
 mod store;
 mod ui;
 

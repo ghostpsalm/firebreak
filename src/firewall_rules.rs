@@ -90,7 +90,7 @@ pub fn backup_dir() -> PathBuf {
 /// human-readable diffing. Returns the .wfw path.
 pub fn backup_policy(rules: &[RuleInfo]) -> Result<PathBuf> {
     let dir = backup_dir();
-    std::fs::create_dir_all(&dir)?;
+    crate::secure_dir::ensure_secured_dir(&dir)?;
     let stamp = Utc::now().format("%Y%m%dT%H%M%SZ");
     let wfw = dir.join(format!("firewall-{stamp}.wfw"));
     let json = dir.join(format!("rules-{stamp}.json"));
