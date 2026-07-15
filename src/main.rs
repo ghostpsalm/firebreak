@@ -43,11 +43,13 @@ fn parse_args() -> Args {
             "--no-ui" => args.no_ui = true,
             "--dump-filters" => args.dump_filters = true,
             "--ui-preview" => args.ui_preview = true,
-            "--db" => {
-                if let Some(p) = it.next() {
-                    args.db_path = p.into();
+            "--db" => match it.next() {
+                Some(p) => args.db_path = p.into(),
+                None => {
+                    eprintln!("--db requires a path argument");
+                    std::process::exit(2);
                 }
-            }
+            },
             "--help" | "-h" => {
                 println!(
                     "firebreak — Windows Firewall rule-usage auditor\n\n\
@@ -129,10 +131,6 @@ fn main() -> Result<()> {
              if events stop appearing, re-check with: auditpol /get /subcategory:{}",
             audit_control::FILTERING_PLATFORM_CONNECTION_GUID
         );
-        if args.enable_only {
-            println!("--enable-only: done. Run firebreak again later to analyze.");
-            return Ok(());
-        }
         note = "Collection just started — usage data will be empty until traffic accumulates."
             .to_string();
     } else if store.checkpoint()?.is_none() {
@@ -143,6 +141,13 @@ fn main() -> Result<()> {
             "collection_started",
             &event_query::first_event_time()?.unwrap_or_else(now_iso),
         )?;
+    }
+
+    // exits here whether auditing was just enabled or already on — the flag
+    // promises "ensure collection is running, don't analyze"
+    if args.enable_only {
+        println!("--enable-only: auditing is enabled. Run firebreak again later to analyze.");
+        return Ok(());
     }
 
     // ---- ingest ----
@@ -424,16 +429,17 @@ fn print_text_report(rows: &[ui::RuleRow], store: &Store) -> Result<()> {
     }
 
     println!("\n=== Used rules (most hits first) ===");
-    for r in sorted.iter().rev().filter(|r| r.total_hits() > 0) {
-        let u = r.usage.as_ref().unwrap();
-        println!(
-            "  {:>8} allow / {:>6} block  {}  last {}  apps: {}",
-            u.allow_count,
-            u.block_count,
-            r.rule.display_name,
-            u.last_seen.as_deref().unwrap_or("-"),
-            r.seen_apps.join(", ")
-        );
+    for r in sorted.iter().rev() {
+        if let Some(u) = r.usage.as_ref().filter(|u| u.allow_count + u.block_count > 0) {
+            println!(
+                "  {:>8} allow / {:>6} block  {}  last {}  apps: {}",
+                u.allow_count,
+                u.block_count,
+                r.rule.display_name,
+                u.last_seen.as_deref().unwrap_or("-"),
+                r.seen_apps.join(", ")
+            );
+        }
     }
 
     println!("\n=== Baseline flags ===");
