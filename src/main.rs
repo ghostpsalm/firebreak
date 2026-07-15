@@ -313,9 +313,10 @@ fn main() -> Result<()> {
     );
 
     // ---- report ----
+    let mut all_usage = store.all_usage()?;
     let mut rows: Vec<ui::RuleRow> = Vec::with_capacity(rules.len());
     for rule in rules {
-        let usage = store.usage_for(&rule.name)?;
+        let usage = all_usage.remove(&rule.name);
         let flags = baseline_checks::flags_for(&rule);
         let seen_apps: Vec<String> = usage
             .as_ref()

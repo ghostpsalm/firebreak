@@ -212,17 +212,69 @@ impl Store {
         })
     }
 
+    /// Keeps only the first snapshot (the rule set as it stood when
+    /// collection started) and the latest — enough to answer "what changed
+    /// since the audit began" without growing the DB on every run.
     pub fn snapshot_rules(&self, rules: &[RuleInfo], now_iso: &str) -> Result<()> {
         let json = serde_json::to_string(rules)?;
         self.conn.execute(
             "INSERT INTO rule_snapshot (snapshot_at, rule_json) VALUES (?1, ?2)",
             params![now_iso, json],
         )?;
+        self.conn.execute(
+            "DELETE FROM rule_snapshot WHERE snapshot_at NOT IN (
+                (SELECT MIN(snapshot_at) FROM rule_snapshot),
+                (SELECT MAX(snapshot_at) FROM rule_snapshot)
+            )",
+            [],
+        )?;
         Ok(())
     }
 
     // ---- reporting ----
 
+    /// All usage in two whole-table queries (instead of two per rule).
+    /// Apps are ordered by hits within each rule.
+    pub fn all_usage(&self) -> Result<std::collections::HashMap<String, RuleUsage>> {
+        let mut map: std::collections::HashMap<String, RuleUsage> =
+            std::collections::HashMap::new();
+        let mut stmt = self.conn.prepare(
+            "SELECT rule_id, allow_count, block_count, first_seen, last_seen FROM rule_usage",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(RuleUsage {
+                rule_id: row.get(0)?,
+                allow_count: row.get(1)?,
+                block_count: row.get(2)?,
+                first_seen: row.get(3)?,
+                last_seen: row.get(4)?,
+                apps: Vec::new(),
+            })
+        })?;
+        for u in rows {
+            let u = u?;
+            map.insert(u.rule_id.clone(), u);
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT rule_id, app_path, hits FROM rule_apps ORDER BY rule_id, hits DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        for r in rows {
+            let (rule_id, app, hits) = r?;
+            if let Some(u) = map.get_mut(&rule_id) {
+                u.apps.push((app, hits));
+            }
+        }
+        Ok(map)
+    }
+
+    #[allow(dead_code)]
     pub fn usage_for(&self, rule_id: &str) -> Result<Option<RuleUsage>> {
         let mut stmt = self.conn.prepare(
             "SELECT allow_count, block_count, first_seen, last_seen
@@ -253,21 +305,14 @@ impl Store {
     }
 
     /// All usage rows whose rule_id starts with 'unmatched:' — events we
-    /// could not attribute to any firewall rule.
+    /// could not attribute to any firewall rule — most hits first.
     pub fn unmatched_usage(&self) -> Result<Vec<RuleUsage>> {
-        let mut out = Vec::new();
-        let mut stmt = self.conn.prepare(
-            "SELECT rule_id FROM rule_usage WHERE rule_id LIKE 'unmatched:%'
-             ORDER BY allow_count + block_count DESC",
-        )?;
-        let ids: Vec<String> = stmt
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<std::result::Result<_, _>>()?;
-        for id in ids {
-            if let Some(u) = self.usage_for(&id)? {
-                out.push(u);
-            }
-        }
+        let mut out: Vec<RuleUsage> = self
+            .all_usage()?
+            .into_values()
+            .filter(|u| u.rule_id.starts_with("unmatched:"))
+            .collect();
+        out.sort_by_key(|u| -(u.allow_count + u.block_count));
         Ok(out)
     }
 }
