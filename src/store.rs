@@ -304,6 +304,29 @@ impl Store {
         Ok(Some(usage))
     }
 
+    /// filter (id, boot_session) -> recorded WFP filter display name, for
+    /// explaining unattributed events (most are WFP default/built-in
+    /// filters whose names say so, e.g. "Default Outbound Block").
+    pub fn filter_names(&self) -> Result<std::collections::HashMap<(u64, String), String>> {
+        let mut map = std::collections::HashMap::new();
+        let mut stmt = self.conn.prepare(
+            "SELECT filter_id, boot_session, filter_name FROM filter_map
+             WHERE filter_name IS NOT NULL AND filter_name != ''",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)? as u64,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        for r in rows {
+            let (id, session, name) = r?;
+            map.insert((id, session), name);
+        }
+        Ok(map)
+    }
+
     /// All usage rows whose rule_id starts with 'unmatched:' — events we
     /// could not attribute to any firewall rule — most hits first.
     pub fn unmatched_usage(&self) -> Result<Vec<RuleUsage>> {

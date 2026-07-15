@@ -19,38 +19,46 @@ Cross from Linux: `cargo build --release --target x86_64-pc-windows-gnu`
 
 ## Run
 
-Run **elevated**. Modes are auto-detected:
+Double-click the exe — an embedded `requireAdministrator` manifest brings up
+the UAC prompt (with a ShellExecute "runas" fallback if launched some other
+way). The app boots straight to the rule table; everything else happens on
+background workers:
 
-1. **First run (auditing off):** enables the "Filtering Platform Connection"
-   audit subcategory (success+failure), grows the Security log to 512 MiB if
-   smaller, snapshots the current rule set, and starts the collection clock.
-   The pre-existing audit state and log size are recorded first, so
-   `--restore-audit` can put the host back exactly as found. There is no
-   retroactive data — run this as early as possible, then come back
-   days/weeks later. Use `--enable-only` to do just this and exit (it exits
-   after confirming collection is on even if auditing was already enabled).
-2. **Auditing already on, first run of the tool:** ingests whatever history
-   the Security log still holds.
+1. **First run (auditing off):** the header shows an **Enable connection
+   auditing** button. Clicking it records the pre-existing audit state and
+   log size (so `--restore-audit` can put the host back exactly as found),
+   enables the "Filtering Platform Connection" subcategory, grows the
+   Security log to 512 MiB if smaller, snapshots the rule set, and starts
+   the collection clock. There is no retroactive data — enable as early as
+   possible, then come back days/weeks later. Meanwhile the table already
+   shows every rule with its scope and current listeners.
+2. **Auditing already on, first run of the tool:** adopts whatever history
+   the Security log still holds and analyzes it.
 3. **Normal run:** ingests events since the last checkpoint (tracked by
    Security-channel EventRecordID — exact, no re-reads or drops), aggregates
-   per-rule usage into `%ProgramData%\firebreak\firebreak.db`, and opens the
-   UI. Ingestion is a single transaction: a crash rolls back cleanly and the
-   rerun cannot double-count.
+   per-rule usage into `%ProgramData%\firebreak\firebreak.db`, and shows the
+   report. Ingestion is a single transaction: a crash rolls back cleanly and
+   the rerun cannot double-count.
 
-Flags: `--enable-only`, `--no-ui` (text report), `--dump-filters`
-(diagnostics, see below), `--restore-audit` (revert audit policy + log size
-to the recorded pre-firebreak state), `--ui-preview` (mock-data UI, no
-elevation needed), `--db <path>`.
+Headless flags (attach to the launching terminal): `--enable-only`, `--no-ui`
+(text report), `--dump-filters` (diagnostics, see below), `--restore-audit`
+(revert audit policy + log size to the recorded pre-firebreak state),
+`--ui-preview` (mock-data UI), `--db <path>`.
 
-The UI lists every rule with allow/block hit counts, last-seen time, the
-applications observed hitting it (friendly names from PE version info), and
-static baseline flags (mDNS/SSDP/LLMNR/RDP/SMB/broad-allow…). Checkboxes set
-the intended enabled-state; **Apply** runs on a background thread: it first
-writes a full policy backup to
-`%ProgramData%\firebreak\backups\firewall-<stamp>.wfw` (restore with
-`netsh advfirewall import <file>`) plus a JSON rule dump, then commits via
-`Set-NetFirewallRule` in chunks of 100 (nothing is applied if the backup
-fails).
+The table shows, per rule: profile tags (with Domain/Private/Public view
+filters — default view is **enabled rules only**), scope
+(protocol/ports/program), allow/block hit counts, last-seen time, the
+applications observed hitting it (friendly names from PE version info),
+**which process is currently listening** on an inbound rule's ports
+(netstat-style, via Get-NetTCPConnection/-NetUDPEndpoint), and static
+baseline flags (mDNS/SSDP/LLMNR/RDP/SMB/broad-allow…). Collapsible bottom
+panels list all active listening sockets and the unattributed events with
+the WFP filter names they matched. Checkboxes set the intended
+enabled-state; **Apply** runs on a background thread: it first writes a full
+policy backup to `%ProgramData%\firebreak\backups\firewall-<stamp>.wfw`
+(restore with `netsh advfirewall import <file>`) plus a JSON rule dump, then
+commits via `Set-NetFirewallRule` in chunks of 100 (nothing is applied if
+the backup fails).
 
 ## Attribution model (what makes the numbers trustworthy)
 
@@ -63,9 +71,13 @@ fails).
 - Filter→rule matching uses anchored tokens from the filter's providerData
   (exact InstanceID equality, never substring), falling back to display-name
   equality only when the display name is unambiguous.
-- **Unattributed events** are normal in moderation: WFP has built-in/default
-  filters that aren't firewall rules. Running the tool at least once per
-  boot session keeps attribution tight.
+- **Unattributed events** are normal — and for blocked traffic, expected:
+  port scans, pings against closed services, and other unsolicited traffic
+  match WFP's built-in *default block* filters, which are not firewall
+  rules. The Unattributed panel shows each filter's recorded name (e.g.
+  "Default Inbound Block") so these are distinguishable from genuine
+  attribution gaps. Rule attribution is exercised by *allowed* traffic.
+  Running the tool at least once per boot session keeps attribution tight.
 - Local audit policy can be reverted by **Group Policy** refresh. If event
   ingestion drops to zero unexpectedly:
   `auditpol /get /subcategory:{0CCE9226-69AE-11D9-BED3-505054503030}`

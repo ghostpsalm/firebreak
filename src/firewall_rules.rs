@@ -12,7 +12,7 @@ use std::process::Command;
 
 use crate::model::RuleInfo;
 
-fn run_powershell(script: &str) -> Result<String> {
+pub(crate) fn run_powershell(script: &str) -> Result<String> {
     let utf16: Vec<u8> = script
         .encode_utf16()
         .flat_map(|u| u.to_le_bytes())

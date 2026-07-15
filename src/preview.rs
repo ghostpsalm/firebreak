@@ -4,7 +4,9 @@
 
 use anyhow::Result;
 
-use crate::{baseline_checks, ui};
+use crate::listeners::Listener;
+use crate::pipeline::UnmatchedRow;
+use crate::{baseline_checks, listeners, ui};
 
 /// Launch the UI with representative mock data — for developing/reviewing
 /// the interface without a Windows box or collected data.
@@ -119,29 +121,83 @@ pub fn run() -> Result<()> {
     specs[2].0.description =
         Some("Inbound rule for the Remote Desktop service to allow RDP traffic. [TCP 3389]".into());
 
+    fn mock_listener(proto: &str, addr: &str, port: u32, pid: u32, name: &str, path: &str) -> Listener {
+        Listener {
+            proto: proto.into(),
+            local_address: addr.into(),
+            local_port: port,
+            pid,
+            process_name: name.into(),
+            process_path: path.into(),
+        }
+    }
+    let mock_listeners = vec![
+        mock_listener("TCP", "0.0.0.0", 3389, 1104, "svchost", r"C:\Windows\System32\svchost.exe"),
+        mock_listener("TCP", "0.0.0.0", 445, 4, "System", ""),
+        mock_listener("TCP", "127.0.0.1", 9100, 5522, "printerutil", r"C:\Program Files\HP\printerutil.exe"),
+        mock_listener("UDP", "0.0.0.0", 5353, 7810, "chrome", r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
+        mock_listener("UDP", "0.0.0.0", 1900, 1220, "svchost", r"C:\Windows\System32\svchost.exe"),
+        mock_listener("TCP", "0.0.0.0", 135, 948, "svchost", r"C:\Windows\System32\svchost.exe"),
+    ];
+
     let rows = specs
         .into_iter()
         .map(|(rule, usage, apps)| {
             let flags = baseline_checks::flags_for(&rule);
+            let listening = listeners::listeners_for_rule(&rule, &mock_listeners);
             let target_enabled = rule.is_enabled();
             ui::RuleRow {
                 rule,
                 usage,
                 flags,
                 seen_apps: apps.into_iter().map(Into::into).collect(),
+                listening,
                 target_enabled,
             }
         })
         .collect();
 
-    ui::run(
+    // what a ping/nmap session looks like: blocked traffic lands on WFP's
+    // built-in default block filters, not on firewall rules
+    let unmatched = vec![
+        UnmatchedRow {
+            filter_id: "68231".into(),
+            boot_session: "2026-07-14T07:58:03.1204418Z".into(),
+            filter_name: "Default Inbound Block".into(),
+            usage: RuleUsage {
+                rule_id: "unmatched:2026-07-14T07:58:03.1204418Z:68231".into(),
+                allow_count: 0,
+                block_count: 486,
+                first_seen: Some("2026-07-15T09:12:00.000Z".into()),
+                last_seen: Some("2026-07-15T09:14:31.000Z".into()),
+                apps: vec![("System".into(), 486)],
+            },
+        },
+        UnmatchedRow {
+            filter_id: "67810".into(),
+            boot_session: "2026-07-14T07:58:03.1204418Z".into(),
+            filter_name: "ICMP Echo Request v6 Default Block".into(),
+            usage: RuleUsage {
+                rule_id: "unmatched:2026-07-14T07:58:03.1204418Z:67810".into(),
+                allow_count: 0,
+                block_count: 37,
+                first_seen: Some("2026-07-15T09:10:02.000Z".into()),
+                last_seen: Some("2026-07-15T09:10:44.000Z".into()),
+                apps: vec![("System".into(), 37)],
+            },
+        },
+    ];
+
+    ui::run_preview(
         rows,
         ui::AuditContext {
             collection_started: Some("2026-07-01T08:00:00.000Z".into()),
             last_ingest: Some("2026-07-15T18:45:12.000Z".into()),
             events_processed: 184_232,
-            unmatched_events: 1_240,
+            unmatched_events: 523,
             note: String::new(),
         },
+        unmatched,
+        mock_listeners,
     )
 }
