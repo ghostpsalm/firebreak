@@ -17,6 +17,12 @@ pub fn now_iso() -> String {
     Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
 }
 
+pub fn hostname() -> String {
+    std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "this host".to_string())
+}
+
 /// One unattributed bucket, explained: which WFP filter the events matched
 /// (by recorded name when we have it), in which boot session.
 pub struct UnmatchedRow {
@@ -114,13 +120,13 @@ pub fn rules_only(progress: &dyn Fn(&str)) -> Result<AnalysisResult> {
     Ok(AnalysisResult {
         rows,
         ctx: ui::AuditContext {
+            hostname: hostname(),
+            auditing_active: false,
             collection_started: None,
             last_ingest: None,
             events_processed: 0,
             unmatched_events: 0,
-            note: "Connection auditing is not enabled — no usage data exists yet. \
-                   Enable it to start the collection clock."
-                .to_string(),
+            note: String::new(),
         },
         unmatched: Vec::new(),
         listeners,
@@ -358,6 +364,8 @@ pub fn analyze(db_path: &Path, progress: &dyn Fn(&str)) -> Result<AnalysisResult
         .collect();
 
     let ctx = ui::AuditContext {
+        hostname: hostname(),
+        auditing_active: true,
         collection_started: store.get_meta("collection_started")?,
         last_ingest: store.get_meta("last_ingest")?,
         events_processed,

@@ -29,6 +29,10 @@ pub struct RuleInfo {
     pub local_port: Option<String>,
     #[serde(rename = "RemotePort", default)]
     pub remote_port: Option<String>,
+    #[serde(rename = "Service", default)]
+    pub service: Option<String>,
+    #[serde(rename = "RemoteAddress", default)]
+    pub remote_address: Option<String>,
 }
 
 impl RuleInfo {
@@ -138,6 +142,9 @@ pub struct RuleUsage {
     pub last_seen: Option<String>,
     /// distinct application paths seen hitting this rule, with per-app hits
     pub apps: Vec<(String, i64)>,
+    /// distinct remote peer addresses observed (source for inbound,
+    /// destination for outbound)
+    pub distinct_peers: i64,
 }
 
 /// A static baseline advisory attached to a rule by pattern matching.
@@ -165,6 +172,8 @@ mod tests {
             protocol: None,
             local_port: None,
             remote_port: None,
+            service: None,
+            remote_address: None,
         }
     }
 

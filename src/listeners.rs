@@ -138,11 +138,12 @@ pub fn listeners_for_rule(rule: &RuleInfo, listeners: &[Listener]) -> Vec<String
         };
         if port_ok && program_ok {
             let name = if l.process_name.is_empty() {
-                format!("pid {}", l.pid)
+                format!("pid{}", l.pid)
             } else {
                 l.process_name.clone()
             };
-            let entry = format!("{} :{}/{}", name, l.local_port, l.proto);
+            // design chip format: process:port
+            let entry = format!("{}:{}", name, l.local_port);
             if !out.contains(&entry) {
                 out.push(entry);
             }
@@ -151,32 +152,35 @@ pub fn listeners_for_rule(rule: &RuleInfo, listeners: &[Listener]) -> Vec<String
     out
 }
 
-/// Compact scope string for the table column: protocol, local ports, and
-/// program basename. "Any" scope renders as "Any".
+/// Compact scope string for the table column, design format:
+/// "TCP 3389 · svchost", "TCP any · anydesk.exe", "UDP 53 · svchost".
+/// "Any" scope renders as "Any". Full path is detail-panel material.
 pub fn scope_summary(rule: &RuleInfo) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    let proto = rule.protocol.as_deref().unwrap_or("");
-    let ports = rule.local_port.as_deref().unwrap_or("");
-    if !proto.is_empty() && !proto.eq_ignore_ascii_case("any") {
-        if ports.is_empty() || ports.eq_ignore_ascii_case("any") {
-            parts.push(proto.to_string());
-        } else {
-            parts.push(format!("{proto} {ports}"));
-        }
-    } else if !ports.is_empty() && !ports.eq_ignore_ascii_case("any") {
-        parts.push(ports.to_string());
-    }
-    if let Some(prog) = rule
+    let proto = rule
+        .protocol
+        .as_deref()
+        .filter(|p| !p.is_empty() && !p.eq_ignore_ascii_case("any"));
+    let ports = rule
+        .local_port
+        .as_deref()
+        .filter(|p| !p.is_empty() && !p.eq_ignore_ascii_case("any"));
+    let prog = rule
         .program
         .as_deref()
         .filter(|p| !p.is_empty() && !p.eq_ignore_ascii_case("any"))
-    {
-        parts.push(basename(prog).to_string());
-    }
-    if parts.is_empty() {
-        "Any".to_string()
-    } else {
-        parts.join(" • ")
+        .map(basename);
+
+    let net = match (proto, ports) {
+        (Some(pr), Some(po)) => Some(format!("{pr} {po}")),
+        (Some(pr), None) => Some(format!("{pr} any")),
+        (None, Some(po)) => Some(po.to_string()),
+        (None, None) => None,
+    };
+    match (net, prog) {
+        (Some(n), Some(p)) => format!("{n} · {p}"),
+        (Some(n), None) => n,
+        (None, Some(p)) => p.to_string(),
+        (None, None) => "Any".to_string(),
     }
 }
 
@@ -198,6 +202,8 @@ mod tests {
             protocol: proto.map(Into::into),
             local_port: lport.map(Into::into),
             remote_port: None,
+            service: None,
+            remote_address: None,
         }
     }
 
@@ -219,7 +225,7 @@ mod tests {
             listener("UDP", 3389, "other", ""),
         ];
         let r = rule("Inbound", Some("TCP"), Some("3389"), None);
-        assert_eq!(listeners_for_rule(&r, &ls), vec!["svchost :3389/TCP"]);
+        assert_eq!(listeners_for_rule(&r, &ls), vec!["svchost:3389"]);
     }
 
     #[test]
@@ -233,7 +239,7 @@ mod tests {
             listener("TCP", 5010, "other", r"C:\other.exe"),
         ];
         let r = rule("Inbound", Some("TCP"), Some("5000-5020"), Some(svchost));
-        assert_eq!(listeners_for_rule(&r, &ls), vec!["svchost :5010/TCP"]);
+        assert_eq!(listeners_for_rule(&r, &ls), vec!["svchost:5010"]);
     }
 
     #[test]
@@ -256,7 +262,7 @@ mod tests {
     fn program_rule_without_ports_matches_by_process() {
         let ls = vec![listener("UDP", 5353, "chrome", r"C:\Program Files\Google\Chrome\Application\chrome.exe")];
         let r = rule("Inbound", Some("UDP"), None, Some(r"C:\Program Files\Google\Chrome\Application\chrome.exe"));
-        assert_eq!(listeners_for_rule(&r, &ls), vec!["chrome :5353/UDP"]);
+        assert_eq!(listeners_for_rule(&r, &ls), vec!["chrome:5353"]);
     }
 
     #[test]
@@ -271,7 +277,11 @@ mod tests {
         assert_eq!(scope_summary(&rule("Inbound", Some("TCP"), Some("3389"), None)), "TCP 3389");
         assert_eq!(
             scope_summary(&rule("Inbound", Some("UDP"), Some("5353"), Some(r"C:\x\chrome.exe"))),
-            "UDP 5353 • chrome.exe"
+            "UDP 5353 · chrome.exe"
+        );
+        assert_eq!(
+            scope_summary(&rule("Inbound", Some("TCP"), None, Some(r"C:\x\anydesk.exe"))),
+            "TCP any · anydesk.exe"
         );
         assert_eq!(scope_summary(&rule("Inbound", None, None, None)), "Any");
         assert_eq!(

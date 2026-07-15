@@ -260,6 +260,8 @@ mod tests {
             protocol: None,
             local_port: None,
             remote_port: None,
+            service: None,
+            remote_address: None,
         }
     }
 

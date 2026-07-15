@@ -51,6 +51,14 @@ impl Store {
                 PRIMARY KEY (rule_id, app_path)
             );
 
+            -- distinct remote peers per rule (source addr for inbound,
+            -- destination for outbound) — powers "N distinct source IPs"
+            CREATE TABLE IF NOT EXISTS rule_peers (
+                rule_id TEXT NOT NULL,
+                peer    TEXT NOT NULL,
+                PRIMARY KEY (rule_id, peer)
+            );
+
             -- WFP filter-id -> rule mapping, persisted per run and keyed by
             -- boot session (boot start time, ISO). Filter run-time IDs are
             -- only meaningful within one boot: the same numeric ID can name
@@ -161,6 +169,17 @@ impl Store {
                 last_seen = MAX(last_seen, ?3)",
         )?;
         stmt.execute(params![rule_id, app_normalized, ev.time_created])?;
+        let peer = if ev.direction.eq_ignore_ascii_case("inbound") {
+            ev.source_address.as_str()
+        } else {
+            ev.dest_address.as_str()
+        };
+        if !peer.is_empty() && peer != "-" {
+            let mut stmt = self.conn.prepare_cached(
+                "INSERT OR IGNORE INTO rule_peers (rule_id, peer) VALUES (?1, ?2)",
+            )?;
+            stmt.execute(params![rule_id, peer])?;
+        }
         Ok(())
     }
 
@@ -249,6 +268,7 @@ impl Store {
                 first_seen: row.get(3)?,
                 last_seen: row.get(4)?,
                 apps: Vec::new(),
+                distinct_peers: 0,
             })
         })?;
         for u in rows {
@@ -271,6 +291,18 @@ impl Store {
                 u.apps.push((app, hits));
             }
         }
+        let mut stmt = self
+            .conn
+            .prepare("SELECT rule_id, COUNT(*) FROM rule_peers GROUP BY rule_id")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        for r in rows {
+            let (rule_id, n) = r?;
+            if let Some(u) = map.get_mut(&rule_id) {
+                u.distinct_peers = n;
+            }
+        }
         Ok(map)
     }
 
@@ -289,6 +321,7 @@ impl Store {
                 first_seen: row.get(2)?,
                 last_seen: row.get(3)?,
                 apps: Vec::new(),
+                distinct_peers: 0,
             },
             None => return Ok(None),
         };

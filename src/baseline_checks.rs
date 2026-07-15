@@ -149,6 +149,8 @@ mod tests {
             protocol: proto.map(Into::into),
             local_port: lport.map(Into::into),
             remote_port: None,
+            service: None,
+            remote_address: None,
         }
     }
 

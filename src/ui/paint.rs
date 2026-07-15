@@ -1,0 +1,1442 @@
+//! Rendering for the main window, split out of ui.rs. Chrome bands use egui
+//! painting with explicit fonts/colors from the design tokens; the rule
+//! table is custom-painted for exact grid, checkbox-intent, chip, and
+//! accent-edge fidelity.
+
+use super::{cell_text, chip, App, Phase, Sort, Tab};
+use crate::listeners::{self, Listener};
+use crate::theme::{self as t};
+use crate::time_util;
+use eframe::egui::{self, Align2, Color32, Pos2, Rect, Sense, Stroke, Vec2};
+
+const TITLEBAR_H: f32 = 32.0;
+
+// ---- vector glyphs (Plex + egui fallback lack ▲ ▾ ✕ ✓ ⌕) ----
+mod glyph {
+    use eframe::egui::{self, Color32, Pos2, Rect, Stroke, Vec2};
+
+    pub fn check(p: &egui::Painter, center: Pos2, size: f32, color: Color32) {
+        let s = size / 2.0;
+        let a = Pos2::new(center.x - s, center.y - s * 0.1);
+        let b = Pos2::new(center.x - s * 0.25, center.y + s * 0.6);
+        let c = Pos2::new(center.x + s * 0.9, center.y - s * 0.7);
+        let w = (size * 0.16).max(1.3);
+        p.line_segment([a, b], Stroke::new(w, color));
+        p.line_segment([b, c], Stroke::new(w, color));
+    }
+
+    pub fn cross(p: &egui::Painter, center: Pos2, size: f32, color: Color32) {
+        let s = size / 2.0;
+        let w = (size * 0.14).max(1.2);
+        p.line_segment([Pos2::new(center.x - s, center.y - s), Pos2::new(center.x + s, center.y + s)], Stroke::new(w, color));
+        p.line_segment([Pos2::new(center.x + s, center.y - s), Pos2::new(center.x - s, center.y + s)], Stroke::new(w, color));
+    }
+
+    pub fn tri_down(p: &egui::Painter, center: Pos2, size: f32, color: Color32) {
+        let s = size / 2.0;
+        p.add(egui::Shape::convex_polygon(
+            vec![
+                Pos2::new(center.x - s, center.y - s * 0.6),
+                Pos2::new(center.x + s, center.y - s * 0.6),
+                Pos2::new(center.x, center.y + s * 0.8),
+            ],
+            color,
+            Stroke::NONE,
+        ));
+    }
+
+    pub fn tri_up(p: &egui::Painter, center: Pos2, size: f32, color: Color32) {
+        let s = size / 2.0;
+        p.add(egui::Shape::convex_polygon(
+            vec![
+                Pos2::new(center.x - s, center.y + s * 0.6),
+                Pos2::new(center.x + s, center.y + s * 0.6),
+                Pos2::new(center.x, center.y - s * 0.8),
+            ],
+            color,
+            Stroke::NONE,
+        ));
+    }
+
+    /// Advisory triangle with a hollow center dot — reads as a warning mark.
+    pub fn warn_tri(p: &egui::Painter, center: Pos2, size: f32, color: Color32) {
+        tri_up(p, center, size, color);
+    }
+
+    pub fn magnifier(p: &egui::Painter, center: Pos2, color: Color32) {
+        let r = 4.0;
+        let c = Pos2::new(center.x - 1.0, center.y - 1.0);
+        p.circle_stroke(c, r, Stroke::new(1.3, color));
+        p.line_segment(
+            [Pos2::new(c.x + r * 0.7, c.y + r * 0.7), Pos2::new(c.x + r * 1.6, c.y + r * 1.6)],
+            Stroke::new(1.3, color),
+        );
+    }
+
+    pub fn minimize(p: &egui::Painter, center: Pos2, color: Color32) {
+        p.line_segment([Pos2::new(center.x - 5.0, center.y), Pos2::new(center.x + 5.0, center.y)], Stroke::new(1.2, color));
+    }
+
+    pub fn restore(p: &egui::Painter, center: Pos2, color: Color32) {
+        let r = Rect::from_center_size(center, Vec2::splat(9.0));
+        p.rect_stroke(r, 0.0, Stroke::new(1.2, color));
+    }
+}
+
+pub fn window(app: &mut App, ctx: &egui::Context) {
+    titlebar(app, ctx);
+    header(app, ctx);
+    if let Some(hours) = app.young_evidence_hours() {
+        warning_band(app, ctx, hours);
+    } else if !app.ctx_info.note.is_empty() {
+        note_band(app, ctx);
+    }
+    if app.phase == Phase::NeedsEnable {
+        firstrun_band(app, ctx);
+    }
+    filter_bar(app, ctx);
+    footer(app, ctx);
+    drawer(app, ctx);
+    if app.selected.is_some() {
+        detail_panel(app, ctx);
+    }
+    central(app, ctx);
+    if app.confirm_open {
+        confirm_modal(app, ctx);
+    }
+}
+
+// ---- title bar ----
+
+fn titlebar(app: &App, ctx: &egui::Context) {
+    egui::TopBottomPanel::top("titlebar")
+        .exact_height(TITLEBAR_H)
+        .frame(egui::Frame::none().fill(t::TITLEBAR))
+        .show(ctx, |ui| {
+            let rect = ui.max_rect();
+            let p = ui.painter();
+            super::stroke_bottom(p, rect, t::BORDER);
+            // logo square
+            let logo = Rect::from_min_size(Pos2::new(rect.left() + 12.0, rect.center().y - 6.0), Vec2::splat(12.0));
+            p.rect_filled(logo, 0.0, t::LOGO_RED);
+            p.text(
+                Pos2::new(logo.right() + 8.0, rect.center().y),
+                Align2::LEFT_CENTER,
+                "firebreak",
+                t::semibold(12.0),
+                t::INK,
+            );
+            let host = if app.ctx_info.hostname.is_empty() {
+                String::new()
+            } else {
+                format!(" · {}", app.ctx_info.hostname)
+            };
+            p.text(
+                Pos2::new(logo.right() + 8.0 + 66.0, rect.center().y),
+                Align2::LEFT_CENTER,
+                format!("— Windows Firewall usage audit{host}"),
+                t::sans(11.0),
+                t::FAINT,
+            );
+            for i in 0..3 {
+                let c = Pos2::new(rect.right() - 42.0 * (3.0 - i as f32) + 21.0, rect.center().y);
+                match i {
+                    0 => glyph::minimize(p, c, t::TERTIARY),
+                    1 => glyph::restore(p, c, t::TERTIARY),
+                    _ => glyph::cross(p, c, 9.0, t::TERTIARY),
+                }
+            }
+        });
+}
+
+// ---- evidence header ----
+
+fn header(app: &mut App, ctx: &egui::Context) {
+    egui::TopBottomPanel::top("header")
+        .frame(egui::Frame::none().fill(Color32::WHITE).inner_margin(egui::Margin::symmetric(PAGE, 10.0)))
+        .show(ctx, |ui| {
+            super::stroke_bottom(ui.painter(), ui.max_rect().expand2(Vec2::new(PAGE, 10.0)), t::BORDER_LIGHT);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                let active = app.ctx_info.auditing_active;
+                dot(ui, if active { t::LIVE } else { t::CB_EMPTY_BORDER });
+                ui.add_space(8.0);
+                if active {
+                    let since = app
+                        .ctx_info
+                        .collection_started
+                        .as_deref()
+                        .map(time_util::since_with_age)
+                        .unwrap_or_else(|| "just now".into());
+                    stat(ui, "Auditing active", &format!("since {since}"));
+                } else {
+                    stat(ui, "Auditing is off", "no connection data has ever been collected");
+                }
+
+                if active {
+                    divider(ui);
+                    let last = app
+                        .ctx_info
+                        .last_ingest
+                        .as_deref()
+                        .map(|s| format!("this run · last ingest {}", time_util::relative(s)))
+                        .unwrap_or_else(|| "this run".into());
+                    let events = if app.phase == Phase::Loading || app.phase == Phase::Enabling {
+                        format!("ingesting… {}", app.progress)
+                    } else {
+                        format!("{} events", t::fmt_thousands(app.ctx_info.events_processed as i64))
+                    };
+                    stat(ui, &events, &last);
+
+                    divider(ui);
+                    let gap = !app.ctx_info.note.is_empty();
+                    stat(
+                        ui,
+                        if gap { "Coverage gap" } else { "Coverage complete" },
+                        if gap { "see warning above" } else { "no gaps detected in audit log" },
+                    );
+                }
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    settings_button(ui);
+                    if active {
+                        ui.add_space(8.0);
+                        if flat_button(ui, "Refresh now").clicked() {
+                            if let (Some(db), Phase::Ready) = (app.db_path.clone(), app.phase) {
+                                app.phase = Phase::Loading;
+                                app.spawn_detect(db, ctx.clone());
+                            }
+                        }
+                    }
+                });
+            });
+        });
+}
+
+fn dot(ui: &mut egui::Ui, color: Color32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
+    ui.painter().circle_filled(rect.center(), 4.0, color);
+}
+
+fn stat(ui: &mut egui::Ui, value: &str, caption: &str) {
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 1.0;
+        ui.label(egui::RichText::new(value).font(t::semibold(12.0)).color(t::INK));
+        ui.label(egui::RichText::new(caption).font(t::sans(11.0)).color(t::TERTIARY));
+    });
+}
+
+fn divider(ui: &mut egui::Ui) {
+    ui.add_space(24.0);
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(1.0, 26.0), Sense::hover());
+    ui.painter().vline(rect.center().x, rect.y_range(), Stroke::new(1.0, t::BORDER_LIGHT));
+    ui.add_space(24.0);
+}
+
+const PAGE: f32 = super::PAGE_PAD;
+
+fn flat_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    let galley = ui.painter().layout_no_wrap(label.to_string(), t::sans(12.0), t::INK);
+    let size = Vec2::new(galley.size().x + 24.0, galley.size().y + 10.0);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let fill = if resp.hovered() { Color32::WHITE } else { t::RAISED };
+    ui.painter().rect(rect, 0.0, fill, Stroke::new(1.0, t::CONTROL_BORDER));
+    ui.painter().galley(rect.center() - galley.size() / 2.0, galley, t::INK);
+    resp
+}
+
+/// "Settings ▾" with a drawn caret.
+fn settings_button(ui: &mut egui::Ui) -> egui::Response {
+    let galley = ui.painter().layout_no_wrap("Settings".to_string(), t::sans(12.0), t::INK);
+    let size = Vec2::new(galley.size().x + 34.0, galley.size().y + 10.0);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let fill = if resp.hovered() { Color32::WHITE } else { t::RAISED };
+    ui.painter().rect(rect, 0.0, fill, Stroke::new(1.0, t::CONTROL_BORDER));
+    ui.painter().galley(Pos2::new(rect.left() + 12.0, rect.center().y - galley.size().y / 2.0), galley, t::INK);
+    glyph::tri_down(ui.painter(), Pos2::new(rect.right() - 12.0, rect.center().y), 8.0, t::TERTIARY);
+    resp
+}
+
+// ---- warning band ----
+
+fn warning_band(app: &App, ctx: &egui::Context, hours: f64) {
+    egui::TopBottomPanel::top("warning")
+        .frame(egui::Frame::none().fill(t::ADVISORY_BG).inner_margin(egui::Margin::symmetric(PAGE, 8.0)))
+        .show(ctx, |ui| {
+            super::stroke_bottom(ui.painter(), ui.max_rect().expand2(Vec2::new(PAGE, 8.0)), t::ADVISORY_BORDER);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("▲").font(t::sans(12.0)).color(t::ADVISORY));
+                ui.add_space(6.0);
+                let human = if hours < 48.0 {
+                    format!("Only {} hours of evidence.", hours.round() as i64)
+                } else {
+                    format!("Only {} days of evidence.", (hours / 24.0).round() as i64)
+                };
+                let mut job = egui::text::LayoutJob::default();
+                job.append(&human, 0.0, fmt(t::semibold(12.0), t::ADVISORY_TEXT));
+                job.append(
+                    "  Zero-hit values are not yet meaningful — weekly and monthly traffic hasn't \
+                     had a chance to occur. Apply is limited to enabling rules until coverage matures.",
+                    0.0,
+                    fmt(t::sans(12.0), t::ADVISORY_TEXT),
+                );
+                ui.label(job);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let _ = app;
+                    ui.label(
+                        egui::RichText::new("override")
+                            .font(t::sans(11.0))
+                            .color(t::ADVISORY_HEADER)
+                            .underline(),
+                    );
+                });
+            });
+        });
+}
+
+fn note_band(app: &App, ctx: &egui::Context) {
+    egui::TopBottomPanel::top("note")
+        .frame(egui::Frame::none().fill(t::ADVISORY_BG).inner_margin(egui::Margin::symmetric(PAGE, 8.0)))
+        .show(ctx, |ui| {
+            super::stroke_bottom(ui.painter(), ui.max_rect().expand2(Vec2::new(PAGE, 8.0)), t::ADVISORY_BORDER);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("▲").font(t::sans(12.0)).color(t::ADVISORY));
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new(&app.ctx_info.note).font(t::sans(12.0)).color(t::ADVISORY_TEXT));
+            });
+        });
+}
+
+fn fmt(font: egui::FontId, color: Color32) -> egui::text::TextFormat {
+    egui::text::TextFormat { font_id: font, color, ..Default::default() }
+}
+
+// ---- first-run band ----
+
+fn firstrun_band(app: &mut App, ctx: &egui::Context) {
+    egui::TopBottomPanel::top("firstrun")
+        .frame(egui::Frame::none().fill(t::ACCENT_TINT).inner_margin(egui::Margin::symmetric(PAGE, 12.0)))
+        .show(ctx, |ui| {
+            super::stroke_bottom(ui.painter(), ui.max_rect().expand2(Vec2::new(PAGE, 12.0)), t::ACCENT_TINT_BORDER);
+            ui.horizontal(|ui| {
+                let enabling = app.phase == Phase::Enabling;
+                let label = if enabling { "Enabling…" } else { "Enable connection auditing" };
+                let galley = ui.painter().layout_no_wrap(label.to_string(), t::semibold(13.0), Color32::WHITE);
+                let size = Vec2::new(galley.size().x + 40.0, galley.size().y + 16.0);
+                let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+                let fill = if enabling { t::ACCENT.gamma_multiply(0.6) } else if resp.hovered() { t::ACCENT.gamma_multiply(1.1) } else { t::ACCENT };
+                ui.painter().rect_filled(rect, 0.0, fill);
+                ui.painter().galley(rect.center() - galley.size() / 2.0, galley, Color32::WHITE);
+                if resp.clicked() && !enabling {
+                    app.start_enable(ctx);
+                }
+                ui.add_space(16.0);
+                let mut job = egui::text::LayoutJob::default();
+                job.wrap.max_width = ui.available_width();
+                job.append(
+                    "Turns on Windows Filtering Platform audit events (security log, ~40 MB/day at typical load). ",
+                    0.0, fmt(t::sans(12.0), t::INK));
+                job.append("Nothing is blocked or modified", 0.0, fmt(t::semibold(12.0), t::INK));
+                job.append(
+                    " — firebreak only records which rules the traffic matches. Usage columns fill in as evidence \
+                     accumulates; plan on ~7–14 days before zero-hit values mean anything.",
+                    0.0, fmt(t::sans(12.0), t::INK));
+                ui.label(job);
+            });
+        });
+}
+
+// ---- filter bar ----
+
+fn filter_bar(app: &mut App, ctx: &egui::Context) {
+    egui::TopBottomPanel::top("filterbar")
+        .frame(egui::Frame::none().fill(t::CHROME).inner_margin(egui::Margin::symmetric(PAGE, 7.0)))
+        .show(ctx, |ui| {
+            super::stroke_bottom(ui.painter(), ui.max_rect().expand2(Vec2::new(PAGE, 7.0)), t::BORDER_LIGHT);
+            ui.horizontal(|ui| {
+                // search box with a drawn magnifier
+                let search = egui::TextEdit::singleline(&mut app.filter_text)
+                    .hint_text("  Filter rules…")
+                    .desired_width(224.0)
+                    .font(t::sans(12.0));
+                let resp = ui.add(search);
+                glyph::magnifier(ui.painter(), Pos2::new(resp.rect.left() + 10.0, resp.rect.center().y), t::FAINT);
+                ui.add_space(4.0);
+
+                // enabled/zero-hit/flagged segmented group
+                let zero_enabled = app.ctx_info.auditing_active;
+                segmented3(
+                    ui,
+                    [
+                        ("Enabled only", &mut app.only_enabled, true),
+                        ("Zero-hit", &mut app.only_zero_hit, zero_enabled),
+                        ("Flagged", &mut app.only_flagged, true),
+                    ],
+                );
+                ui.add_space(4.0);
+                // profile group
+                segmented3(
+                    ui,
+                    [
+                        ("Domain", &mut app.show_domain, true),
+                        ("Private", &mut app.show_private, true),
+                        ("Public", &mut app.show_public, true),
+                    ],
+                );
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let total = app.rows.len();
+                    let shown = app.visible().len();
+                    let mut job = egui::text::LayoutJob::default();
+                    job.append(&t::fmt_thousands(total as i64), 0.0, fmt(t::semibold(11.5), t::INK));
+                    job.append(" rules · ", 0.0, fmt(t::sans(11.5), t::TERTIARY));
+                    job.append(&t::fmt_thousands(shown as i64), 0.0, fmt(t::semibold(11.5), t::INK));
+                    job.append(" shown", 0.0, fmt(t::sans(11.5), t::TERTIARY));
+                    ui.label(job);
+                });
+            });
+        });
+}
+
+/// Three-segment toggle group with the dark active fill from the design.
+fn segmented3(ui: &mut egui::Ui, segs: [(&str, &mut bool, bool); 3]) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        let n = segs.len();
+        for (i, (label, state, enabled)) in segs.into_iter().enumerate() {
+            let galley_col = if *state { Color32::WHITE } else if enabled { t::SECONDARY } else { t::CB_EMPTY_BORDER };
+            let galley = ui.painter().layout_no_wrap(label.to_string(), t::sans(11.5), galley_col);
+            let size = Vec2::new(galley.size().x + 20.0, galley.size().y + 8.0);
+            let sense = if enabled { Sense::click() } else { Sense::hover() };
+            let (rect, resp) = ui.allocate_exact_size(size, sense);
+            let fill = if *state { t::DARK_SEGMENT } else { Color32::WHITE };
+            ui.painter().rect_filled(rect, 0.0, fill);
+            // outer + inter-segment borders
+            let border = Stroke::new(1.0, t::CONTROL_BORDER);
+            if i == 0 {
+                ui.painter().rect_stroke(rect, 0.0, border);
+            } else {
+                ui.painter().rect_stroke(rect, 0.0, Stroke::NONE);
+                ui.painter().hline(rect.x_range(), rect.top() + 0.5, border);
+                ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, border);
+                ui.painter().vline(rect.right() - 0.5, rect.y_range(), border);
+                let seam = if *state || segs_prev_active(i) { t::SECONDARY } else { t::CONTROL_BORDER };
+                ui.painter().vline(rect.left() + 0.5, rect.y_range(), Stroke::new(1.0, seam));
+            }
+            let _ = n;
+            ui.painter().galley(rect.center() - galley.size() / 2.0, galley, galley_col);
+            if enabled && resp.clicked() {
+                *state = !*state;
+            }
+        }
+    });
+}
+
+// segmented seam color helper can't see siblings cheaply; approximate
+fn segs_prev_active(_i: usize) -> bool {
+    false
+}
+
+// ---- central: table + empty state ----
+
+struct Cols {
+    check: f32,
+    name: (f32, f32),
+    dir: (f32, f32),
+    action: (f32, f32),
+    profiles: (f32, f32),
+    scope: (f32, f32),
+    hits: (f32, f32),
+    last: (f32, f32),
+    apps: (f32, f32),
+    listen: (f32, f32),
+}
+
+impl Cols {
+    fn compute(left: f32, width: f32) -> Cols {
+        let fixed = 34.0 + 44.0 + 54.0 + 118.0 + 150.0 + 100.0 + 78.0 + 132.0;
+        let flex = (width - fixed).max(300.0);
+        let name_w = (flex * (1.35 / 2.35)).max(190.0);
+        let apps_w = (flex - name_w).max(100.0);
+        let mut x = left;
+        let mut col = |w: f32| {
+            let a = x;
+            x += w;
+            (a, w)
+        };
+        Cols {
+            check: col(34.0).0,
+            name: col(name_w),
+            dir: col(44.0),
+            action: col(54.0),
+            profiles: col(118.0),
+            scope: col(150.0),
+            hits: col(100.0),
+            last: col(78.0),
+            apps: col(apps_w),
+            listen: col(132.0),
+        }
+    }
+}
+
+fn central(app: &mut App, ctx: &egui::Context) {
+    egui::CentralPanel::default()
+        .frame(egui::Frame::none().fill(Color32::WHITE))
+        .show(ctx, |ui| {
+            if app.rows.is_empty() && matches!(app.phase, Phase::Loading | Phase::Enabling) {
+                ui.centered_and_justified(|ui| {
+                    ui.label(egui::RichText::new(&app.progress).font(t::sans(12.0)).color(t::SECONDARY));
+                });
+                return;
+            }
+            let full = ui.max_rect();
+            let cols = Cols::compute(full.left(), full.width());
+            table_header(ui, app, &cols);
+            let visible = app.visible();
+            if visible.is_empty() {
+                empty_state(app, ui);
+                return;
+            }
+            let row_area = Rect::from_min_max(
+                Pos2::new(full.left(), full.top() + HEADER_H),
+                full.max,
+            );
+            let mut child = ui.child_ui(row_area, egui::Layout::top_down(egui::Align::Min), None);
+            egui::ScrollArea::vertical().auto_shrink([false; 2]).show_rows(
+                &mut child,
+                ROW_H,
+                visible.len(),
+                |ui, range| {
+                    for vi in range {
+                        let ri = visible[vi];
+                        let (rect, resp) = ui.allocate_exact_size(Vec2::new(cols.listen.0 + cols.listen.1 - full.left(), ROW_H), Sense::click());
+                        // recompute cols relative to this row rect's left
+                        let rc = Cols::compute(rect.left(), rect.width());
+                        row(app, ui, ri, rect, &rc, resp);
+                    }
+                },
+            );
+        });
+}
+
+use super::ROW_H;
+use super::HEADER_H;
+
+fn table_header(ui: &mut egui::Ui, app: &mut App, cols: &Cols) {
+    let full = ui.max_rect();
+    let rect = Rect::from_min_size(full.min, Vec2::new(full.width(), HEADER_H));
+    let p = ui.painter();
+    p.rect_filled(rect, 0.0, t::RAISED);
+    p.hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, t::CONTROL_BORDER));
+    let font = t::semibold(11.0);
+    let c = t::SECONDARY;
+    let y = rect.center().y;
+    let th = |x: f32, s: &str, col: Color32| {
+        ui.painter().text(Pos2::new(x, y), Align2::LEFT_CENTER, s, font.clone(), col);
+    };
+    let young = app.young_evidence_hours().is_some();
+    let usage_hidden = app.phase == Phase::NeedsEnable;
+    th(cols.name.0 + 10.0, "Rule", c);
+    th(cols.dir.0, "Dir", c);
+    th(cols.action.0, "Action", c);
+    th(cols.profiles.0, "Profiles", c);
+    th(cols.scope.0, "Scope", c);
+    if usage_hidden {
+        ui.painter().text(
+            Pos2::new(cols.hits.0, y),
+            Align2::LEFT_CENTER,
+            "Hits · Last seen · Apps",
+            font.clone(),
+            t::CB_EMPTY_BORDER,
+        );
+        ui.painter().text(
+            Pos2::new(cols.hits.0 + 128.0, y),
+            Align2::LEFT_CENTER,
+            "requires auditing",
+            t::italic(11.0),
+            t::CB_EMPTY_BORDER,
+        );
+    } else {
+        // hits header: clickable sort + young-evidence tint
+        let hits_rect = Rect::from_min_size(Pos2::new(cols.hits.0, rect.top()), Vec2::new(cols.hits.1, HEADER_H));
+        let last_rect = Rect::from_min_size(Pos2::new(cols.last.0, rect.top()), Vec2::new(cols.last.1, HEADER_H));
+        if young {
+            ui.painter().rect_filled(hits_rect, 0.0, t::ADVISORY_BG);
+            ui.painter().rect_filled(last_rect, 0.0, t::ADVISORY_BG);
+        }
+        let hits_col = if young { t::ADVISORY_HEADER } else { t::INK };
+        th(cols.hits.0 + 6.0, "Hits A / B", hits_col);
+        // sort/young indicator triangle after the label
+        let hg = ui.painter().layout_no_wrap("Hits A / B".into(), font.clone(), hits_col);
+        let ax = cols.hits.0 + 6.0 + hg.size().x + 7.0;
+        if young {
+            glyph::warn_tri(ui.painter(), Pos2::new(ax, y), 8.0, t::ADVISORY);
+        } else if app.sort == Sort::Hits {
+            if app.sort_asc {
+                glyph::tri_up(ui.painter(), Pos2::new(ax, y), 8.0, hits_col);
+            } else {
+                glyph::tri_down(ui.painter(), Pos2::new(ax, y), 8.0, hits_col);
+            }
+        }
+        th(cols.last.0, "Last seen", if young { t::ADVISORY_HEADER } else { c });
+        th(cols.apps.0, "Apps observed", c);
+        th(cols.listen.0 + 10.0, "Listening now", c);
+        // sort interactions
+        if ui.interact(hits_rect, ui.id().with("sort_hits"), Sense::click()).clicked() {
+            toggle_sort(app, Sort::Hits);
+        }
+        if ui.interact(last_rect, ui.id().with("sort_last"), Sense::click()).clicked() {
+            toggle_sort(app, Sort::LastSeen);
+        }
+    }
+    let name_rect = Rect::from_min_size(Pos2::new(cols.name.0, rect.top()), Vec2::new(cols.name.1, HEADER_H));
+    if ui.interact(name_rect, ui.id().with("sort_name"), Sense::click()).clicked() {
+        toggle_sort(app, Sort::Name);
+    }
+}
+
+fn toggle_sort(app: &mut App, key: Sort) {
+    if app.sort == key {
+        app.sort_asc = !app.sort_asc;
+    } else {
+        app.sort = key;
+        app.sort_asc = matches!(key, Sort::Name); // names A→Z, counts/time high→low
+    }
+}
+
+fn row(app: &mut App, ui: &mut egui::Ui, ri: usize, rect: Rect, cols: &Cols, resp: egui::Response) {
+    // apply-phase status for this rule, if any
+    let apply_status = app.apply.as_ref().and_then(|a| {
+        let r = &app.rows[ri];
+        if !(r.pending() || a.results.contains_key(&r.rule.name)) {
+            return None;
+        }
+        Some(match a.results.get(&r.rule.name) {
+            Some(Ok(target)) => RowApply::Done(*target),
+            Some(Err(e)) => RowApply::Failed(e.clone()),
+            None if a.current.as_deref() == Some(r.rule.name.as_str()) => RowApply::Active(r.target_enabled),
+            None if !a.finished => RowApply::Queued,
+            None => RowApply::Pending,
+        })
+    });
+
+    let r = &app.rows[ri];
+    let selected = app.selected == Some(ri);
+    let pending = r.pending();
+    let saved_on = r.rule.is_enabled();
+    let dimmed = !saved_on && !pending;
+    let failed = matches!(apply_status, Some(RowApply::Failed(_)));
+
+    // background
+    let bg = if failed {
+        t::FAIL_BG
+    } else if selected {
+        t::SELECTED_ROW
+    } else if pending {
+        t::ACCENT_TINT
+    } else if resp.hovered() {
+        t::HOVER_WASH
+    } else {
+        Color32::WHITE
+    };
+    let p = ui.painter();
+    p.rect_filled(rect, 0.0, bg);
+    p.hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, t::ROW_BORDER));
+    // edge bar
+    if failed {
+        p.rect_filled(Rect::from_min_size(rect.min, Vec2::new(3.0, rect.height())), 0.0, t::DESTRUCTIVE);
+    } else if pending {
+        p.rect_filled(Rect::from_min_size(rect.min, Vec2::new(3.0, rect.height())), 0.0, t::ACCENT);
+    }
+
+    let queued_dim = matches!(apply_status, Some(RowApply::Queued));
+    let text_col = if dimmed || queued_dim { t::DISABLED } else { t::INK };
+
+    // checkbox
+    let cb_rect = Rect::from_center_size(Pos2::new(cols.check + 17.0, rect.center().y), Vec2::splat(13.0));
+    draw_checkbox(ui.painter(), cb_rect, saved_on, pending, r.target_enabled);
+    let cb_resp = ui.interact(cb_rect.expand(3.0), ui.id().with(("cb", ri)), Sense::click());
+
+    // name (+ flag)
+    let name_font = if pending && !dimmed { t::medium(12.0) } else { t::sans(12.0) };
+    let flag_pad = if !r.flags.is_empty() { 16.0 } else { 0.0 };
+    let name_rect = Rect::from_min_size(Pos2::new(cols.name.0, rect.top()), Vec2::new(cols.name.1 - 10.0 - flag_pad, rect.height()));
+    cell_text(ui.painter(), name_rect, &r.rule.display_name, name_font, text_col, 10.0);
+    if !r.flags.is_empty() {
+        // width of name for flag placement
+        let g = ui.painter().layout_no_wrap(r.rule.display_name.clone(), t::sans(12.0), t::ADVISORY);
+        let fx = (cols.name.0 + 10.0 + g.size().x + 10.0).min(cols.name.0 + cols.name.1 - 10.0);
+        glyph::warn_tri(ui.painter(), Pos2::new(fx, rect.center().y), 9.0, t::ADVISORY);
+    }
+
+    // dir / action
+    cell_text(ui.painter(), col_rect(cols.dir, rect), dir_short(&r.rule.direction), t::sans(11.5), if dimmed { t::DISABLED } else { t::TERTIARY }, 0.0);
+    let act_col = if dimmed { t::DISABLED } else if r.rule.action.eq_ignore_ascii_case("block") { t::BLOCK } else { t::INK };
+    cell_text(ui.painter(), col_rect(cols.action, rect), act_short(&r.rule.action), t::sans(12.0), act_col, 0.0);
+
+    // profiles chips
+    let mut cx = cols.profiles.0;
+    for tag in r.rule.profile_tags() {
+        cx += chip(ui.painter(), Pos2::new(cx, rect.center().y - 7.5), tag);
+    }
+
+    // scope (mono)
+    cell_text(ui.painter(), Rect::from_min_size(Pos2::new(cols.scope.0, rect.top()), Vec2::new(cols.scope.1 - 8.0, rect.height())), &listeners::scope_summary(&r.rule), t::mono(11.0), if dimmed { t::DISABLED } else { t::SECONDARY }, 0.0);
+
+    // usage columns (hidden on first run)
+    if app.phase == Phase::NeedsEnable {
+        ui.painter().text(Pos2::new(cols.hits.0, rect.center().y), Align2::LEFT_CENTER, "—  ·  —  ·  —", t::sans(11.0), t::FIRSTRUN_DASH);
+    } else if let Some(st) = &apply_status {
+        // apply status occupies the last-seen/apps span
+        let (txt, col) = st.label(r);
+        ui.painter().text(Pos2::new(cols.hits.0 + 6.0, rect.center().y), Align2::LEFT_CENTER, hits_ab(r).0, t::mono(11.5), t::DISABLED);
+        ui.painter().text(Pos2::new(cols.last.0, rect.center().y), Align2::LEFT_CENTER, &txt, if matches!(st, RowApply::Active(_)) { t::mono_medium(11.0) } else { t::sans(11.0) }, col);
+    } else {
+        // hits A / B
+        let (a, b, azero, bnz) = hits_ab_parts(r);
+        let hx = cols.hits.0 + 6.0;
+        let ga = ui.painter().layout_no_wrap(a.clone(), t::mono(11.5), if azero { t::DISABLED } else { t::INK });
+        let wa = ga.size().x;
+        ui.painter().galley(Pos2::new(hx, rect.center().y - ga.size().y / 2.0), ga, if azero { t::DISABLED } else { t::INK });
+        ui.painter().text(Pos2::new(hx + wa + 4.0, rect.center().y), Align2::LEFT_CENTER, "/", t::mono(11.5), t::HAIRLINE_TEXT);
+        ui.painter().text(Pos2::new(hx + wa + 12.0, rect.center().y), Align2::LEFT_CENTER, &b, t::mono(11.5), if bnz { t::BLOCK } else { t::DISABLED });
+
+        // last seen
+        let (last_txt, last_col) = match r.usage.as_ref().and_then(|u| u.last_seen.as_deref()) {
+            Some(ls) => (time_util::relative(ls), t::SECONDARY),
+            None => ("never".to_string(), t::DISABLED),
+        };
+        cell_text(ui.painter(), col_rect(cols.last, rect), &last_txt, t::sans(11.0), last_col, 0.0);
+
+        // apps observed
+        let apps = apps_summary(r);
+        let (apps_txt, apps_col) = if apps.is_empty() { ("—".to_string(), t::HAIRLINE_TEXT) } else { (apps, t::SECONDARY) };
+        cell_text(ui.painter(), Rect::from_min_size(Pos2::new(cols.apps.0, rect.top()), Vec2::new(cols.apps.1 - 8.0, rect.height())), &apps_txt, t::sans(11.0), apps_col, 0.0);
+
+        // listening chip
+        if let Some(first) = r.listening.first() {
+            draw_listen_chip(ui.painter(), Pos2::new(cols.listen.0 + 10.0, rect.center().y - 8.5), first);
+        } else {
+            ui.painter().text(Pos2::new(cols.listen.0 + 10.0, rect.center().y), Align2::LEFT_CENTER, "—", t::sans(11.0), t::HAIRLINE_TEXT);
+        }
+    }
+
+    // tooltip built while the immutable borrow is live, so mutations below
+    // don't overlap it
+    let tip = format!(
+        "{}\n{}",
+        r.rule.description.as_deref().filter(|d| !d.trim().is_empty()).unwrap_or("(no description)"),
+        listeners::scope_summary(&r.rule)
+    );
+
+    // interactions
+    if cb_resp.clicked() && app.apply.is_none() {
+        app.rows[ri].target_enabled = !app.rows[ri].target_enabled;
+    } else if resp.clicked() {
+        app.selected = if selected { None } else { Some(ri) };
+    }
+    if resp.hovered() {
+        resp.on_hover_text(tip);
+    }
+}
+
+enum RowApply {
+    Queued,
+    Pending,
+    Active(bool),
+    Done(bool),
+    Failed(String),
+}
+
+impl RowApply {
+    fn label(&self, _r: &super::RuleRow) -> (String, Color32) {
+        match self {
+            RowApply::Queued => ("queued".into(), t::TERTIARY),
+            RowApply::Pending => ("pending".into(), t::TERTIARY),
+            RowApply::Active(target) => (if *target { "enabling…".into() } else { "disabling…".into() }, t::ACCENT),
+            RowApply::Done(target) => (if *target { "enabled ✓".into() } else { "disabled ✓".into() }, t::LIVE_TEXT),
+            RowApply::Failed(e) => (format!("failed — {}", short_err(e)), t::DESTRUCTIVE),
+        }
+    }
+}
+
+fn short_err(e: &str) -> String {
+    let line = e.lines().next().unwrap_or(e);
+    if line.len() > 60 { format!("{}…", &line[..60]) } else { line.to_string() }
+}
+
+fn col_rect(c: (f32, f32), row: Rect) -> Rect {
+    Rect::from_min_size(Pos2::new(c.0, row.top()), Vec2::new(c.1, row.height()))
+}
+
+fn dir_short(d: &str) -> &str {
+    if d.eq_ignore_ascii_case("inbound") { "In" } else if d.eq_ignore_ascii_case("outbound") { "Out" } else { d }
+}
+fn act_short(a: &str) -> &str {
+    if a.eq_ignore_ascii_case("allow") { "Allow" } else if a.eq_ignore_ascii_case("block") { "Block" } else { a }
+}
+
+fn hits_ab(r: &super::RuleRow) -> (&'static str, &'static str) {
+    let _ = r;
+    ("", "")
+}
+fn hits_ab_parts(r: &super::RuleRow) -> (String, String, bool, bool) {
+    match &r.usage {
+        Some(u) => (
+            t::fmt_thousands(u.allow_count),
+            t::fmt_thousands(u.block_count),
+            u.allow_count == 0,
+            u.block_count > 0,
+        ),
+        None => ("0".into(), "0".into(), true, false),
+    }
+}
+
+fn apps_summary(r: &super::RuleRow) -> String {
+    if r.seen_apps.is_empty() {
+        return String::new();
+    }
+    let short: Vec<&str> = r.seen_apps.iter().map(|s| s.split(" (").next().unwrap_or(s)).collect();
+    if short.len() <= 2 {
+        short.join(", ")
+    } else {
+        format!("{}, {} +{}", short[0], short[1], short.len() - 2)
+    }
+}
+
+fn draw_checkbox(p: &egui::Painter, rect: Rect, saved_on: bool, pending: bool, target: bool) {
+    let (border, fill, glyph, glyph_col) = if pending {
+        if target {
+            (t::ACCENT, t::ACCENT, true, Color32::WHITE)
+        } else {
+            (t::ACCENT, Color32::WHITE, false, t::INK)
+        }
+    } else if saved_on {
+        (t::CB_SAVED_BORDER, Color32::WHITE, true, t::INK)
+    } else {
+        (t::CB_EMPTY_BORDER, Color32::WHITE, false, t::INK)
+    };
+    p.rect(rect, 0.0, fill, Stroke::new(1.5, border));
+    if glyph {
+        glyph::check(p, rect.center(), 9.0, glyph_col);
+    }
+}
+
+fn draw_listen_chip(p: &egui::Painter, top_left: Pos2, text: &str) {
+    let font = t::mono(10.5);
+    let galley = p.layout_no_wrap(text.to_string(), font, t::LIVE_TEXT);
+    let w = galley.size().x + 14.0 + 11.0;
+    let rect = Rect::from_min_size(top_left, Vec2::new(w, 17.0));
+    p.rect(rect, 0.0, t::LIVE_BG, Stroke::new(1.0, t::LIVE_BORDER));
+    p.circle_filled(Pos2::new(rect.left() + 7.0, rect.center().y), 3.0, t::LIVE);
+    p.galley(Pos2::new(rect.left() + 14.0, rect.center().y - galley.size().y / 2.0), galley, t::LIVE_TEXT);
+}
+
+fn empty_state(app: &mut App, ui: &mut egui::Ui) {
+    let full = ui.max_rect();
+    let area = Rect::from_min_max(Pos2::new(full.left(), full.top() + HEADER_H), full.max);
+    let mut child = ui.child_ui(area, egui::Layout::top_down(egui::Align::Center), None);
+    child.add_space(40.0);
+    let mut msg = egui::text::LayoutJob::default();
+    msg.halign = egui::Align::Center;
+    msg.append("No rules match ", 0.0, fmt(t::sans(12.5), t::SECONDARY));
+    if !app.filter_text.is_empty() {
+        msg.append(&format!("“{}” ", app.filter_text), 0.0, fmt(t::semibold(12.5), t::SECONDARY));
+    }
+    msg.append("with the current filters.", 0.0, fmt(t::sans(12.5), t::SECONDARY));
+    child.label(msg);
+    child.add_space(4.0);
+    let hidden = app.rows.len();
+    child.label(egui::RichText::new(format!("{hidden} rules hidden by the active filters.")).font(t::sans(11.5)).color(t::FAINT));
+    child.add_space(10.0);
+    child.horizontal(|ui| {
+        ui.add_space((ui.available_width() - 240.0).max(0.0) / 2.0);
+        if flat_button(ui, "Clear text").clicked() {
+            app.filter_text.clear();
+        }
+        ui.add_space(10.0);
+        if flat_button(ui, "Clear all filters").clicked() {
+            app.filter_text.clear();
+            app.only_enabled = false;
+            app.only_zero_hit = false;
+            app.only_flagged = false;
+            app.show_domain = true;
+            app.show_private = true;
+            app.show_public = true;
+        }
+    });
+}
+
+// ---- detail panel ----
+
+fn detail_panel(app: &mut App, ctx: &egui::Context) {
+    let Some(ri) = app.selected else { return };
+    egui::SidePanel::right("detail")
+        .exact_width(300.0)
+        .resizable(false)
+        .frame(egui::Frame::none().fill(t::RAISED))
+        .show(ctx, |ui| {
+            ui.painter().vline(ui.max_rect().left(), ui.max_rect().y_range(), Stroke::new(1.0, t::BORDER));
+            let r = &app.rows[ri];
+            egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(14.0);
+                    ui.label(egui::RichText::new(&r.rule.display_name).font(t::semibold(13.0)).color(t::INK));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                        ui.add_space(14.0);
+                        let (r, resp) = ui.allocate_exact_size(Vec2::splat(14.0), Sense::click());
+                        glyph::cross(ui.painter(), r.center(), 10.0, if resp.hovered() { t::INK } else { t::FAINT });
+                        if resp.clicked() {
+                            app.selected = None;
+                        }
+                    });
+                });
+                if let Some(desc) = r.rule.description.as_deref().filter(|d| !d.trim().is_empty()) {
+                    ui.add_space(6.0);
+                    pad_label(ui, egui::RichText::new(desc).font(t::italic(11.5)).color(t::SECONDARY));
+                }
+                ui.add_space(12.0);
+                section_sep(ui);
+
+                // advisory blocks
+                for f in &r.flags {
+                    advisory_block(ui, f);
+                    section_sep(ui);
+                }
+
+                // key-value grid
+                ui.add_space(10.0);
+                kv(ui, "Rule ID", &r.rule.name, true);
+                if let Some(g) = r.rule.group.as_deref().filter(|s| !s.is_empty()) {
+                    kv(ui, "Group", g, false);
+                }
+                kv(ui, "Program", r.rule.program.as_deref().unwrap_or("Any"), true);
+                if let Some(s) = r.rule.service.as_deref().filter(|s| !s.is_empty() && *s != "Any") {
+                    kv(ui, "Service", s, true);
+                }
+                kv(
+                    ui,
+                    "Ports",
+                    &format!(
+                        "{} local {} · remote {}",
+                        r.rule.protocol.as_deref().unwrap_or("Any"),
+                        r.rule.local_port.as_deref().unwrap_or("any"),
+                        r.rule.remote_port.as_deref().unwrap_or("any")
+                    ),
+                    true,
+                );
+                kv(ui, "Remote addr", r.rule.remote_address.as_deref().unwrap_or("any"), true);
+                ui.add_space(10.0);
+                section_sep(ui);
+
+                // evidence
+                ui.add_space(12.0);
+                if let Some(u) = &r.usage {
+                    let total = u.allow_count + u.block_count;
+                    pad_label(ui, egui::RichText::new(format!("Evidence — {} connections", t::fmt_thousands(total))).font(t::semibold(11.5)).color(t::INK));
+                    ui.add_space(8.0);
+                    for (path, hits) in u.apps.iter().take(8) {
+                        ui.horizontal(|ui| {
+                            ui.add_space(14.0);
+                            let name = crate::app_identity::identify(path).friendly_name;
+                            ui.label(egui::RichText::new(name).font(t::sans(11.0)).color(t::INK));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.add_space(14.0);
+                                ui.label(egui::RichText::new(t::fmt_thousands(*hits)).font(t::mono(11.0)).color(t::SECONDARY));
+                            });
+                        });
+                    }
+                    ui.add_space(10.0);
+                    let first = u.first_seen.as_deref().map(time_util::relative).unwrap_or_else(|| "—".into());
+                    let last = u.last_seen.as_deref().map(time_util::relative).unwrap_or_else(|| "—".into());
+                    pad_label(
+                        ui,
+                        egui::RichText::new(format!("First hit {first} · last {last} · {} distinct peers", u.distinct_peers))
+                            .font(t::sans(11.0))
+                            .color(t::SECONDARY),
+                    );
+                } else {
+                    pad_label(ui, egui::RichText::new("No usage evidence collected yet.").font(t::italic(11.5)).color(t::FAINT));
+                }
+                ui.add_space(14.0);
+            });
+        });
+}
+
+fn pad_label(ui: &mut egui::Ui, text: egui::RichText) {
+    ui.horizontal_wrapped(|ui| {
+        ui.add_space(14.0);
+        ui.spacing_mut().item_spacing.x = 0.0;
+        ui.set_max_width(272.0);
+        ui.label(text);
+    });
+}
+
+fn section_sep(ui: &mut egui::Ui) {
+    ui.add_space(2.0);
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
+    ui.painter().hline(rect.x_range(), rect.center().y, Stroke::new(1.0, t::BORDER_LIGHT));
+}
+
+fn advisory_block(ui: &mut egui::Ui, f: &crate::model::BaselineFlag) {
+    egui::Frame::none()
+        .fill(t::ADVISORY_BG)
+        .inner_margin(egui::Margin { left: 14.0, right: 14.0, top: 10.0, bottom: 10.0 })
+        .show(ui, |ui| {
+            ui.set_width(272.0);
+            ui.horizontal(|ui| {
+                let (r, _) = ui.allocate_exact_size(Vec2::new(12.0, 12.0), Sense::hover());
+                glyph::warn_tri(ui.painter(), r.center(), 9.0, t::ADVISORY);
+                ui.label(egui::RichText::new(f.title).font(t::semibold(11.0)).color(t::ADVISORY_TEXT));
+            });
+            ui.add_space(3.0);
+            ui.label(egui::RichText::new(f.advice).font(t::sans(11.0)).color(t::ADVISORY_TEXT));
+        });
+}
+
+fn kv(ui: &mut egui::Ui, label: &str, value: &str, mono: bool) {
+    ui.horizontal_top(|ui| {
+        ui.add_space(14.0);
+        ui.allocate_ui_with_layout(Vec2::new(86.0, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+            ui.label(egui::RichText::new(label).font(t::sans(11.0)).color(t::FAINT));
+        });
+        ui.allocate_ui_with_layout(Vec2::new(184.0, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+            let rt = if mono {
+                egui::RichText::new(value).font(t::mono(10.5)).color(t::INK)
+            } else {
+                egui::RichText::new(value).font(t::sans(11.0)).color(t::INK)
+            };
+            ui.add(egui::Label::new(rt).wrap());
+        });
+    });
+    ui.add_space(7.0);
+}
+
+// ---- evidence drawer ----
+
+fn drawer(app: &mut App, ctx: &egui::Context) {
+    if app.rows.is_empty() {
+        return;
+    }
+    egui::TopBottomPanel::bottom("drawer")
+        .frame(egui::Frame::none().fill(t::RAISED))
+        .show(ctx, |ui| {
+            // tab bar
+            let bar = ui.allocate_exact_size(Vec2::new(ui.available_width(), 27.0), Sense::hover()).0;
+            ui.painter().hline(bar.x_range(), bar.bottom() - 0.5, Stroke::new(1.0, t::BORDER_LIGHT));
+            let mut x = bar.left();
+            let tabs = [
+                (Tab::Sockets, format!("Active listening sockets  {}", app.listeners.len())),
+                (Tab::Unattributed, format!("Unattributed events  {}", app.unmatched.len())),
+            ];
+            for (tab, label) in tabs {
+                let active = app.drawer_open && app.tab == tab;
+                let g = ui.painter().layout_no_wrap(label.clone(), if active { t::semibold(11.5) } else { t::sans(11.5) }, if active { t::INK } else { t::SECONDARY });
+                let w = g.size().x + 28.0;
+                let tab_rect = Rect::from_min_size(Pos2::new(x, bar.top()), Vec2::new(w, 27.0));
+                if active {
+                    ui.painter().rect_filled(tab_rect, 0.0, Color32::WHITE);
+                    ui.painter().hline(tab_rect.x_range(), tab_rect.top() + 1.0, Stroke::new(2.0, t::ACCENT));
+                }
+                ui.painter().vline(tab_rect.right(), tab_rect.y_range(), Stroke::new(1.0, t::BORDER_LIGHT));
+                ui.painter().galley(tab_rect.center() - g.size() / 2.0, g, if active { t::INK } else { t::SECONDARY });
+                if ui.interact(tab_rect, ui.id().with(("tab", label)), Sense::click()).clicked() {
+                    if app.drawer_open && app.tab == tab {
+                        app.drawer_open = false;
+                    } else {
+                        app.drawer_open = true;
+                        app.tab = tab;
+                    }
+                }
+                x += w;
+            }
+            // collapse hint
+            let hint = if app.drawer_open { "collapse" } else { "expand" };
+            let hg = ui.painter().layout_no_wrap(hint.to_string(), t::sans(11.0), t::FAINT);
+            ui.painter().galley(Pos2::new(bar.right() - 14.0 - hg.size().x, bar.center().y - hg.size().y / 2.0), hg, t::FAINT);
+            let tc = Pos2::new(bar.right() - 14.0 - 60.0, bar.center().y);
+            if app.drawer_open {
+                glyph::tri_down(ui.painter(), tc, 8.0, t::FAINT);
+            } else {
+                glyph::tri_up(ui.painter(), tc, 8.0, t::FAINT);
+            }
+
+            if app.drawer_open {
+                ui.allocate_ui(Vec2::new(ui.available_width(), 118.0), |ui| match app.tab {
+                    Tab::Sockets => sockets_body(app, ui),
+                    Tab::Unattributed => unattributed_body(app, ui),
+                });
+            }
+        });
+}
+
+fn sockets_body(app: &App, ui: &mut egui::Ui) {
+    let rect = ui.max_rect();
+    ui.painter().rect_filled(rect, 0.0, Color32::WHITE);
+    // header
+    let hr = Rect::from_min_size(rect.min, Vec2::new(rect.width(), 22.0));
+    let p = ui.painter();
+    let hf = t::semibold(10.5);
+    p.text(Pos2::new(rect.left() + PAGE, hr.center().y), Align2::LEFT_CENTER, "Proto", hf.clone(), t::FAINT);
+    p.text(Pos2::new(rect.left() + PAGE + 60.0, hr.center().y), Align2::LEFT_CENTER, "Local address", hf.clone(), t::FAINT);
+    p.text(Pos2::new(rect.left() + PAGE + 260.0, hr.center().y), Align2::LEFT_CENTER, "Process", hf.clone(), t::FAINT);
+    p.text(Pos2::new(rect.left() + PAGE + 520.0, hr.center().y), Align2::LEFT_CENTER, "Matched rule", hf, t::FAINT);
+    p.hline(rect.x_range(), hr.bottom(), Stroke::new(1.0, t::ROW_BORDER));
+
+    let mut list: Vec<&Listener> = app.listeners.iter().collect();
+    list.sort_by_key(|l| (l.proto.clone(), l.local_port));
+    let inner = Rect::from_min_max(Pos2::new(rect.left(), hr.bottom()), rect.max);
+    let mut child = ui.child_ui(inner, egui::Layout::top_down(egui::Align::Min), None);
+    egui::ScrollArea::vertical().auto_shrink([false; 2]).show(&mut child, |ui| {
+        for l in list {
+            let (rr, _) = ui.allocate_exact_size(Vec2::new(rect.width(), 20.0), Sense::hover());
+            let p = ui.painter();
+            let y = rr.center().y;
+            p.text(Pos2::new(rect.left() + PAGE, y), Align2::LEFT_CENTER, &l.proto, t::mono(11.0), t::INK);
+            p.text(Pos2::new(rect.left() + PAGE + 60.0, y), Align2::LEFT_CENTER, format!("{}:{}", l.local_address, l.local_port), t::mono(11.0), t::INK);
+            let proc = if l.process_name.is_empty() { format!("pid {}", l.pid) } else { format!("{} (pid {})", l.process_name, l.pid) };
+            p.text(Pos2::new(rect.left() + PAGE + 260.0, y), Align2::LEFT_CENTER, proc, t::mono(11.0), t::INK);
+            let matched = matched_rule(app, l);
+            let (txt, col) = match matched {
+                Some(name) => (name, t::INK),
+                None if l.local_address.starts_with("127.") || l.local_address == "::1" => ("loopback — no rule required".to_string(), t::DISABLED),
+                None => ("—".to_string(), t::HAIRLINE_TEXT),
+            };
+            p.text(Pos2::new(rect.left() + PAGE + 520.0, y), Align2::LEFT_CENTER, txt, t::sans(11.0), col);
+            p.hline(rect.x_range(), rr.bottom() - 0.5, Stroke::new(1.0, t::CHROME));
+        }
+    });
+}
+
+fn matched_rule(app: &App, l: &Listener) -> Option<String> {
+    let key = format!("{}:{}", if l.process_name.is_empty() { format!("pid{}", l.pid) } else { l.process_name.clone() }, l.local_port);
+    app.rows
+        .iter()
+        .find(|r| r.rule.is_enabled() && r.listening.iter().any(|e| e == &key))
+        .map(|r| r.rule.display_name.clone())
+}
+
+fn unattributed_body(app: &App, ui: &mut egui::Ui) {
+    let rect = ui.max_rect();
+    ui.painter().rect_filled(rect, 0.0, Color32::WHITE);
+    // permanent explainer
+    let ex = Rect::from_min_size(rect.min, Vec2::new(rect.width(), 26.0));
+    ui.painter().rect_filled(ex, 0.0, t::RAISED);
+    ui.painter().hline(ex.x_range(), ex.bottom(), Stroke::new(1.0, t::ROW_BORDER));
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = rect.width() - 2.0 * PAGE;
+    job.append("Traffic that Windows blocked by default policy — it matched no rule at all. Port scans and stray broadcasts land here. This is normal, not an error.", 0.0, fmt(t::italic(11.0), t::SECONDARY));
+    ui.painter().galley(Pos2::new(rect.left() + PAGE, ex.center().y - 7.0), ui.painter().layout_job(job), t::SECONDARY);
+
+    let inner = Rect::from_min_max(Pos2::new(rect.left(), ex.bottom()), rect.max);
+    let mut child = ui.child_ui(inner, egui::Layout::top_down(egui::Align::Min), None);
+    if app.unmatched.is_empty() {
+        child.centered_and_justified(|ui| {
+            ui.label(egui::RichText::new("Nothing yet — unattributed events appear once auditing is enabled.").font(t::sans(11.5)).color(t::CB_EMPTY_BORDER));
+        });
+        return;
+    }
+    egui::ScrollArea::vertical().auto_shrink([false; 2]).show(&mut child, |ui| {
+        for u in app.unmatched.iter().take(100) {
+            let (rr, _) = ui.allocate_exact_size(Vec2::new(rect.width(), 20.0), Sense::hover());
+            let p = ui.painter();
+            let y = rr.center().y;
+            p.text(Pos2::new(rect.left() + PAGE, y), Align2::LEFT_CENTER, &u.filter_name, t::sans(11.0), t::INK);
+            p.text(Pos2::new(rect.left() + PAGE + 320.0, y), Align2::LEFT_CENTER, format!("filter {}", u.filter_id), t::mono(10.5), t::TERTIARY);
+            p.text(Pos2::new(rect.left() + PAGE + 470.0, y), Align2::LEFT_CENTER, format!("{} allow / {} block", u.usage.allow_count, u.usage.block_count), t::mono(10.5), t::SECONDARY);
+            p.hline(rect.x_range(), rr.bottom() - 0.5, Stroke::new(1.0, t::CHROME));
+        }
+    });
+}
+
+// ---- footer ----
+
+fn footer(app: &mut App, ctx: &egui::Context) {
+    let (dis, en) = app.pending();
+    let has_pending = !dis.is_empty() || !en.is_empty();
+    let running = app.apply_running();
+    let partial = app.apply_partial_failure();
+    if !has_pending && !running && !partial {
+        return;
+    }
+    let (fill, border) = if partial {
+        (t::FAIL_BG, t::FAIL_BORDER)
+    } else {
+        (t::ACCENT_TINT, t::ACCENT_TINT_BORDER)
+    };
+    egui::TopBottomPanel::bottom("footer")
+        .exact_height(44.0)
+        .frame(egui::Frame::none().fill(fill).inner_margin(egui::Margin::symmetric(PAGE, 0.0)))
+        .show(ctx, |ui| {
+            ui.painter().hline(ui.max_rect().expand2(Vec2::new(PAGE, 0.0)).x_range(), ui.max_rect().top(), Stroke::new(1.0, border));
+            if running {
+                footer_running(app, ui);
+            } else if partial {
+                footer_partial(app, ui);
+            } else {
+                footer_pending(app, ui, dis.len(), en.len(), ctx);
+            }
+        });
+}
+
+fn footer_pending(app: &mut App, ui: &mut egui::Ui, dis: usize, en: usize, ctx: &egui::Context) {
+    ui.horizontal_centered(|ui| {
+        let total = dis + en;
+        let mut job = egui::text::LayoutJob::default();
+        job.append(&format!("{total} pending change{}", if total == 1 { "" } else { "s" }), 0.0, fmt(t::semibold(12.0), t::INK));
+        job.append("  —  ", 0.0, fmt(t::sans(12.0), t::SECONDARY));
+        if dis > 0 {
+            job.append(&format!("{dis} to disable", ), 0.0, fmt(t::sans(12.0), t::BLOCK));
+        }
+        if dis > 0 && en > 0 {
+            job.append(" · ", 0.0, fmt(t::sans(12.0), t::SECONDARY));
+        }
+        if en > 0 {
+            job.append(&format!("{en} to enable"), 0.0, fmt(t::sans(12.0), t::ENABLE_GREEN));
+        }
+        ui.label(job);
+        ui.add_space(14.0);
+        if ui.add(egui::Label::new(egui::RichText::new("Revert all").font(t::sans(12.0)).color(t::ACCENT).underline()).sense(Sense::click())).clicked() {
+            app.revert_all();
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let label = format!("Apply {total} change{}…", if total == 1 { "" } else { "s" });
+            if primary_button(ui, &label, t::ACCENT).clicked() {
+                app.confirm_open = true;
+            }
+            ui.add_space(14.0);
+            ui.label(egui::RichText::new("A restorable policy backup is written before any change.").font(t::italic(11.0)).color(t::SECONDARY));
+        });
+    });
+    let _ = ctx;
+}
+
+fn footer_running(app: &mut App, ui: &mut egui::Ui) {
+    let (total, done, current, backup, backup_failed) = {
+        let a = app.apply.as_ref().unwrap();
+        (a.total, a.done, a.current.clone(), a.backup.clone(), a.backup_failed.clone())
+    };
+    let cur_name = current
+        .as_ref()
+        .and_then(|cur| app.rows.iter().find(|r| &r.rule.name == cur).map(|r| r.rule.display_name.clone()))
+        .or_else(|| current.clone())
+        .unwrap_or_default();
+    ui.horizontal_centered(|ui| {
+        let (track, _) = ui.allocate_exact_size(Vec2::new(200.0, 6.0), Sense::hover());
+        ui.painter().rect_filled(track, 0.0, t::PROGRESS_TRACK);
+        let frac = if total > 0 { done as f32 / total as f32 } else { 0.0 };
+        ui.painter().rect_filled(Rect::from_min_size(track.min, Vec2::new(track.width() * frac, track.height())), 0.0, t::ACCENT);
+        ui.add_space(14.0);
+        let step = (done + if current.is_some() { 1 } else { 0 }).min(total).max(1);
+        let mut job = egui::text::LayoutJob::default();
+        job.append(&format!("Applying {step} of {total} "), 0.0, fmt(t::semibold(12.0), t::INK));
+        if !cur_name.is_empty() {
+            job.append(&format!("— {cur_name}"), 0.0, fmt(t::sans(12.0), t::INK));
+        }
+        ui.label(job);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if flat_button(ui, "Stop after current").clicked() {
+                if let Some(a) = &mut app.apply {
+                    a.stop_requested = true;
+                }
+            }
+            ui.add_space(14.0);
+            if let Some(b) = &backup {
+                ui.label(egui::RichText::new(format!("Backup written ✓  {}", b.rsplit(['\\', '/']).next().unwrap_or(b))).font(t::sans(11.0)).color(t::SECONDARY));
+            } else if let Some(e) = &backup_failed {
+                ui.label(egui::RichText::new(format!("Backup failed: {}", short_err(e))).font(t::sans(11.0)).color(t::DESTRUCTIVE));
+            }
+        });
+    });
+}
+
+fn footer_partial(app: &mut App, ui: &mut egui::Ui) {
+    let (ok, fail) = {
+        let a = app.apply.as_ref().unwrap();
+        (a.results.values().filter(|r| r.is_ok()).count(), a.results.values().filter(|r| r.is_err()).count())
+    };
+    ui.horizontal_centered(|ui| {
+        let mut job = egui::text::LayoutJob::default();
+        job.append(&format!("{ok} of {} applied.", ok + fail), 0.0, fmt(t::semibold(12.0), t::DESTRUCTIVE_DARK));
+        job.append(&format!(" {fail} failed and {} still pending — nothing was rolled back.", if fail == 1 { "is" } else { "are" }), 0.0, fmt(t::sans(12.0), t::DESTRUCTIVE_DARK));
+        ui.label(job);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if primary_button(ui, &format!("Retry {fail} failed"), t::ACCENT).clicked() {
+                let ctx = ui.ctx().clone();
+                app.apply = None;
+                app.start_apply(&ctx);
+            }
+            ui.add_space(8.0);
+            if flat_button(ui, "Dismiss").clicked() {
+                // revert intent on failed rows back to saved, clear apply
+                if let Some(a) = app.apply.take() {
+                    for (name, res) in a.results {
+                        if res.is_err() {
+                            if let Some(r) = app.rows.iter_mut().find(|r| r.rule.name == name) {
+                                r.target_enabled = r.rule.is_enabled();
+                            }
+                        }
+                    }
+                }
+            }
+            ui.add_space(14.0);
+            ui.label(egui::RichText::new("Backup retained.").font(t::italic(11.0)).color(t::SECONDARY));
+        });
+    });
+}
+
+fn primary_button(ui: &mut egui::Ui, label: &str, fill: Color32) -> egui::Response {
+    let galley = ui.painter().layout_no_wrap(label.to_string(), t::semibold(12.0), Color32::WHITE);
+    let size = Vec2::new(galley.size().x + 36.0, galley.size().y + 14.0);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let f = if resp.hovered() { fill.gamma_multiply(1.1) } else { fill };
+    ui.painter().rect_filled(rect, 0.0, f);
+    ui.painter().galley(rect.center() - galley.size() / 2.0, galley, Color32::WHITE);
+    resp
+}
+
+// ---- confirm modal ----
+
+fn confirm_modal(app: &mut App, ctx: &egui::Context) {
+    let (dis, en) = app.pending();
+    let total = dis.len() + en.len();
+    // scrim
+    egui::Area::new("scrim".into()).order(egui::Order::Background).show(ctx, |ui| {
+        let r = ctx.screen_rect();
+        ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(44, 62, 80, 102));
+    });
+    let mut open = true;
+    egui::Window::new("confirm")
+        .title_bar(false)
+        .collapsible(false)
+        .resizable(false)
+        .fixed_size(Vec2::new(600.0, 0.0))
+        .anchor(Align2::CENTER_TOP, Vec2::new(0.0, 110.0))
+        .frame(egui::Frame::none().fill(Color32::WHITE).stroke(Stroke::new(1.0, t::CONTROL_BORDER)))
+        .show(ctx, |ui| {
+            // title
+            ui.add_space(16.0);
+            pad20(ui, |ui| {
+                ui.label(egui::RichText::new(format!("Apply {total} change{} to Windows Firewall?", if total == 1 { "" } else { "s" })).font(t::semibold(15.0)).color(t::INK));
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(format!("{} · policy will change immediately for new connections", app.ctx_info.hostname)).font(t::sans(12.0)).color(t::SECONDARY));
+            });
+            ui.add_space(12.0);
+            section_sep(ui);
+            ui.add_space(12.0);
+
+            // change rows
+            pad20(ui, |ui| {
+                for name in dis.iter() {
+                    change_row(app, ui, name, false);
+                }
+                for name in en.iter() {
+                    change_row(app, ui, name, true);
+                }
+            });
+
+            // backup box
+            ui.add_space(12.0);
+            pad20(ui, |ui| {
+                egui::Frame::none()
+                    .fill(t::BACKUP_BG)
+                    .stroke(Stroke::new(1.0, t::BACKUP_BORDER))
+                    .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+                    .show(ui, |ui| {
+                        ui.horizontal_top(|ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            let (r, _) = ui.allocate_exact_size(Vec2::new(13.0, 14.0), Sense::hover());
+                            glyph::check(ui.painter(), r.center(), 11.0, t::LIVE_TEXT);
+                            let mut job = egui::text::LayoutJob::default();
+                            job.wrap.max_width = 500.0;
+                            job.append("A restorable backup of the full firewall policy is written ", 0.0, fmt(t::sans(11.5), t::BACKUP_TEXT));
+                            job.append("before", 0.0, fmt(t::semibold(11.5), t::BACKUP_TEXT));
+                            job.append(" any change, to ", 0.0, fmt(t::sans(11.5), t::BACKUP_TEXT));
+                            job.append("%ProgramData%\\firebreak\\backups\\", 0.0, fmt(t::mono(10.5), t::BACKUP_TEXT));
+                            job.append(" — restore anytime from Settings → Backups.", 0.0, fmt(t::sans(11.5), t::BACKUP_TEXT));
+                            ui.label(job);
+                        });
+                    });
+            });
+            ui.add_space(12.0);
+            section_sep(ui);
+
+            // footer buttons
+            ui.add_space(12.0);
+            pad20(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Changes are also written to the audit log.").font(t::sans(11.0)).color(t::FAINT));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let verb = format!(
+                            "Back up & {}{}{}",
+                            if !dis.is_empty() { format!("disable {}", dis.len()) } else { String::new() },
+                            if !dis.is_empty() && !en.is_empty() { ", " } else { "" },
+                            if !en.is_empty() { format!("enable {}", en.len()) } else { String::new() },
+                        );
+                        if primary_button(ui, &verb, t::DESTRUCTIVE).clicked() {
+                            app.confirm_open = false;
+                            open = false;
+                            app.start_apply(ctx);
+                        }
+                        ui.add_space(10.0);
+                        if flat_button(ui, "Cancel").clicked() {
+                            app.confirm_open = false;
+                            open = false;
+                        }
+                    });
+                });
+            });
+            ui.add_space(14.0);
+        });
+    if !open {
+        app.confirm_open = false;
+    }
+}
+
+fn change_row(app: &App, ui: &mut egui::Ui, name: &str, enable: bool) {
+    let Some(r) = app.rows.iter().find(|r| r.rule.name == name) else { return };
+    let (verb, vc, bg) = if enable {
+        ("ENABLE", t::ENABLE_GREEN, t::BACKUP_BG)
+    } else {
+        ("DISABLE", t::BLOCK, t::VERB_DISABLE_BG)
+    };
+    egui::Frame::none()
+        .fill(bg)
+        .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+        .show(ui, |ui| {
+            ui.horizontal_top(|ui| {
+                ui.allocate_ui_with_layout(Vec2::new(52.0, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                    ui.label(egui::RichText::new(verb).font(t::semibold(11.0)).color(vc));
+                });
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 1.0;
+                    ui.label(egui::RichText::new(&r.rule.display_name).font(t::semibold(12.5)).color(t::INK));
+                    ui.label(egui::RichText::new(reason(r, enable)).font(t::sans(11.0)).color(t::TERTIARY));
+                });
+            });
+        });
+    ui.add_space(1.0);
+}
+
+fn reason(r: &super::RuleRow, enable: bool) -> String {
+    if enable {
+        "currently disabled — will begin allowing this traffic".into()
+    } else {
+        let hits = r.total_hits();
+        let flag = r.flags.first().map(|f| format!(" · flagged: {}", f.title)).unwrap_or_default();
+        let listen = if r.listening.is_empty() { " · not listening" } else { "" };
+        format!("{hits} hits in the audit window{listen}{flag}")
+    }
+}
+
+fn pad20(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+    ui.horizontal(|ui| {
+        ui.add_space(20.0);
+        ui.vertical(|ui| {
+            ui.set_max_width(560.0);
+            add(ui);
+        });
+        ui.add_space(20.0);
+    });
+}

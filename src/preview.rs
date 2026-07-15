@@ -1,151 +1,166 @@
-//! `--ui-preview`: launch the UI with representative mock data — for
-//! developing/reviewing the interface without a Windows box or collected
-//! data. Runs unelevated and touches no Windows APIs.
+//! `--ui-preview`: launch the UI with the design handoff's fixture data —
+//! for reviewing the interface without a Windows box or collected data.
+//! Runs unelevated and touches no Windows APIs.
 
 use anyhow::Result;
+use chrono::{Duration, Utc};
 
-use crate::listeners::Listener;
+use crate::listeners::{self, Listener};
+use crate::model::{RuleInfo, RuleUsage};
 use crate::pipeline::UnmatchedRow;
-use crate::{baseline_checks, listeners, ui};
+use crate::{baseline_checks, ui};
 
-/// Launch the UI with representative mock data — for developing/reviewing
-/// the interface without a Windows box or collected data.
+fn iso_ago(minutes: i64) -> String {
+    (Utc::now() - Duration::minutes(minutes))
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rule(
+    id: &str,
+    display: &str,
+    enabled: bool,
+    dir: &str,
+    action: &str,
+    profile: &str,
+    group: Option<&str>,
+    program: Option<&str>,
+    proto: Option<&str>,
+    lport: Option<&str>,
+    service: Option<&str>,
+    desc: &str,
+) -> RuleInfo {
+    RuleInfo {
+        name: format!("{{{id}}}"),
+        display_name: display.into(),
+        description: Some(desc.into()),
+        enabled: if enabled { "True" } else { "False" }.into(),
+        direction: dir.into(),
+        action: action.into(),
+        profile: profile.into(),
+        group: group.map(Into::into),
+        program: program.map(Into::into),
+        protocol: proto.map(Into::into),
+        local_port: lport.map(Into::into),
+        remote_port: None,
+        service: service.map(Into::into),
+        remote_address: Some("any".into()),
+    }
+}
+
+fn usage(id: &str, allow: i64, block: i64, last_min_ago: i64, apps: &[(&str, i64)]) -> RuleUsage {
+    RuleUsage {
+        rule_id: id.into(),
+        allow_count: allow,
+        block_count: block,
+        first_seen: Some(iso_ago(15 * 24 * 60)),
+        last_seen: Some(iso_ago(last_min_ago)),
+        apps: apps.iter().map(|(p, h)| (p.to_string(), *h)).collect(),
+        distinct_peers: 3,
+    }
+}
+
 pub fn run() -> Result<()> {
-    use crate::model::{RuleInfo, RuleUsage};
-
-    fn rule(
-        name: &str, display: &str, enabled: bool, dir: &str, action: &str, profile: &str,
-        group: Option<&str>, program: Option<&str>, proto: Option<&str>, lport: Option<&str>,
-    ) -> RuleInfo {
-        RuleInfo {
-            name: name.into(),
-            display_name: display.into(),
-            description: None,
-            enabled: if enabled { "True" } else { "False" }.into(),
-            direction: dir.into(),
-            action: action.into(),
-            profile: profile.into(),
-            group: group.map(Into::into),
-            program: program.map(Into::into),
-            protocol: proto.map(Into::into),
-            local_port: lport.map(Into::into),
-            remote_port: None,
-        }
-    }
-    fn usage(id: &str, allow: i64, block: i64, last: &str, apps: &[(&str, i64)]) -> RuleUsage {
-        RuleUsage {
-            rule_id: id.into(),
-            allow_count: allow,
-            block_count: block,
-            first_seen: Some("2026-07-01T08:02:11.000Z".into()),
-            last_seen: Some(last.into()),
-            apps: apps.iter().map(|(p, h)| (p.to_string(), *h)).collect(),
-        }
-    }
-
-    let specs: Vec<(RuleInfo, Option<RuleUsage>, Vec<&str>)> = vec![
+    // (rule, usage, apps, pending_target) — mirrors the design's `raw` fixture
+    let specs: Vec<(RuleInfo, Option<RuleUsage>, Vec<&str>, Option<bool>)> = vec![
         (
-            rule("{a1}", "Core Networking - DNS (UDP-Out)", true, "Outbound", "Allow", "Any",
-                Some("Core Networking"), Some(r"%SystemRoot%\system32\svchost.exe"), Some("UDP"), Some("Any")),
-            Some(usage("{a1}", 48213, 0, "2026-07-15T18:41:02.113Z",
-                &[(r"C:\Windows\System32\svchost.exe", 48213)])),
-            vec!["Host Process for Windows Services (Microsoft Corporation)"],
+            rule("2C5D8F41-9B0A-4E77-A1C3-6F2B90D4E815", "Remote Desktop - User Mode (TCP-In)", true, "Inbound", "Allow", "Domain, Private",
+                Some("Remote Desktop"), Some(r"%SystemRoot%\system32\svchost.exe"), Some("TCP"), Some("3389"), Some("TermService"),
+                "Inbound rule for the Remote Desktop service to allow RDP traffic."),
+            Some(usage("a1", 1204, 0, 4, &[(r"C:\Windows\System32\svchost.exe", 1198), (r"C:\Windows\System32\mstsc.exe", 6)])),
+            vec!["Remote Desktop Services"], None,
         ),
         (
-            rule("{a2}", "Google Chrome (mDNS-In)", true, "Inbound", "Allow", "Any",
-                Some("Google Chrome"), Some(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
-                Some("UDP"), Some("5353")),
-            Some(usage("{a2}", 1522, 0, "2026-07-15T17:12:44.902Z",
-                &[(r"C:\Program Files\Google\Chrome\Application\chrome.exe", 1522)])),
-            vec!["Google Chrome (Google LLC)"],
+            rule("a2", "File and Printer Sharing (SMB-In)", true, "Inbound", "Allow", "Domain, Private, Public",
+                Some("File and Printer Sharing"), Some("System"), Some("TCP"), Some("445"), None,
+                "Inbound rule for File and Printer Sharing via SMB."),
+            Some(usage("a2", 2341, 0, 1, &[("System", 2341)])),
+            vec!["System"], None,
         ),
         (
-            rule("{a3}", "Remote Desktop - User Mode (TCP-In)", true, "Inbound", "Allow", "Domain",
-                Some("Remote Desktop"), None, Some("TCP"), Some("3389")),
-            None,
-            vec![],
+            rule("a3", "mDNS (UDP-In)", true, "Inbound", "Allow", "Any",
+                None, Some(r"%SystemRoot%\system32\svchost.exe"), Some("UDP"), Some("5353"), Some("Dnscache"),
+                "Inbound rule for mDNS multicast name resolution."),
+            Some(usage("a3", 44872, 0, 1, &[(r"C:\Program Files\Google\Chrome\Application\chrome.exe", 40012), (r"%USERPROFILE%\AppData\Roaming\Spotify\Spotify.exe", 4860)])),
+            vec!["Google Chrome (Google LLC)", "Spotify (Spotify AB)"], None,
         ),
         (
-            rule("{a4}", "File and Printer Sharing (SMB-In)", true, "Inbound", "Allow", "Domain, Private",
-                Some("File and Printer Sharing"), Some("System"), Some("TCP"), Some("445")),
-            Some(usage("{a4}", 12, 0, "2026-07-09T10:03:19.000Z", &[("System", 12)])),
-            vec!["System"],
+            rule("a4", "Block QUIC (UDP-Out)", true, "Outbound", "Block", "Domain, Private, Public",
+                None, None, Some("UDP"), Some("443"), None,
+                "Custom rule blocking outbound QUIC to force the TLS inspection path."),
+            Some(usage("a4", 0, 12882, 1, &[(r"C:\Program Files\Google\Chrome\Application\chrome.exe", 9002), (r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe", 3880)])),
+            vec!["Google Chrome (Google LLC)", "msedge"], None,
         ),
         (
-            rule("{a5}", "Spotify", true, "Outbound", "Allow", "Any", None,
-                Some(r"%USERPROFILE%\AppData\Roaming\Spotify\Spotify.exe"), Some("TCP"), None),
-            Some(usage("{a5}", 9214, 0, "2026-07-15T18:20:00.000Z",
-                &[(r"%USERPROFILE%\AppData\Roaming\Spotify\Spotify.exe", 9214)])),
-            vec!["Spotify (Spotify AB)"],
+            rule("a5", "OpenSSH SSH Server (sshd)", true, "Inbound", "Allow", "Domain, Private",
+                Some("OpenSSH Server"), Some(r"%SystemRoot%\System32\OpenSSH\sshd.exe"), Some("TCP"), Some("22"), None,
+                "Inbound rule for the OpenSSH server (sshd)."),
+            Some(usage("a5", 96, 0, 122, &[(r"C:\Windows\System32\OpenSSH\sshd.exe", 96)])),
+            vec!["OpenSSH"], None,
         ),
         (
-            rule("{a6}", "LegacyVPN Client", true, "Inbound", "Allow", "Any", None,
-                Some(r"C:\Program Files (x86)\LegacyVPN\vpngui.exe"), Some("UDP"), Some("500,4500")),
-            None,
-            vec![],
+            rule("a6", "AnyDesk (TCP-In)", true, "Inbound", "Allow", "Domain, Private, Public",
+                None, Some(r"C:\Program Files (x86)\AnyDesk\AnyDesk.exe"), Some("TCP"), None, None,
+                "Vendor-created inbound rule for AnyDesk remote access."),
+            Some(usage("a6", 8, 0, 8640, &[(r"C:\Program Files (x86)\AnyDesk\AnyDesk.exe", 8)])),
+            vec!["AnyDesk"], None,
         ),
         (
-            rule("{a7}", "MyApp Server", true, "Inbound", "Allow", "Any", None, None, None, None),
-            Some(usage("{a7}", 302, 88, "2026-07-15T16:55:31.000Z",
-                &[(r"C:\Tools\myapp\server.exe", 390)])),
-            vec!["server.exe"],
+            rule("a7", "Xbox Game UI (TCP-Out)", true, "Outbound", "Allow", "Any",
+                None, Some(r"C:\Program Files\WindowsApps\GamingServices\gamingservices.exe"), Some("TCP"), None, None,
+                "Outbound rule for Xbox Game UI services."),
+            None, vec![], Some(false), // pending disable
         ),
         (
-            rule("{a8}", "Block uTorrent", true, "Outbound", "Block", "Any", None,
-                Some(r"%USERPROFILE%\AppData\Local\uTorrent\uTorrent.exe"), None, None),
-            Some(usage("{a8}", 0, 4411, "2026-07-15T12:00:09.000Z",
-                &[(r"%USERPROFILE%\AppData\Local\uTorrent\uTorrent.exe", 4411)])),
-            vec!["µTorrent (BitTorrent Inc.)"],
+            rule("a8", "TeamViewer Remote (TCP-In)", true, "Inbound", "Allow", "Domain, Private, Public",
+                None, Some(r"C:\Program Files\TeamViewer\TeamViewer.exe"), Some("TCP"), Some("5938"), None,
+                "Vendor-created inbound rule for TeamViewer."),
+            None, vec![], Some(false), // pending disable
         ),
         (
-            rule("{a9}", "Network Discovery (SSDP-In)", true, "Inbound", "Allow", "Private",
-                Some("Network Discovery"), Some(r"%SystemRoot%\system32\svchost.exe"),
-                Some("UDP"), Some("1900")),
-            Some(usage("{a9}", 233, 0, "2026-07-14T21:38:55.000Z",
-                &[(r"C:\Windows\System32\svchost.exe", 233)])),
-            vec!["Host Process for Windows Services (Microsoft Corporation)"],
+            rule("a9", "Core Networking - DNS (UDP-Out)", false, "Outbound", "Allow", "Domain, Private, Public",
+                Some("Core Networking"), Some(r"%SystemRoot%\system32\svchost.exe"), Some("UDP"), Some("53"), Some("Dnscache"),
+                "Outbound rule to allow DNS requests."),
+            None, vec![], Some(true), // pending enable
         ),
         (
-            rule("{a10}", "Old Printer Utility", false, "Inbound", "Allow", "Any", None,
-                Some(r"C:\Program Files\HP\printerutil.exe"), Some("TCP"), Some("9100")),
-            None,
-            vec![],
+            rule("a10", "Windows Remote Management (HTTP-In)", true, "Inbound", "Allow", "Domain",
+                Some("Windows Remote Management"), Some("System"), Some("TCP"), Some("5985"), None,
+                "Inbound rule for Windows Remote Management via WS-Management."),
+            None, vec![], None,
+        ),
+        (
+            rule("a11", "Network Discovery (SSDP-In)", true, "Inbound", "Allow", "Private",
+                Some("Network Discovery"), Some(r"%SystemRoot%\system32\svchost.exe"), Some("UDP"), Some("1900"), Some("SSDPSRV"),
+                "Inbound rule to allow use of SSDP for network discovery."),
+            Some(usage("a11", 57, 0, 41, &[(r"C:\Windows\explorer.exe", 57)])),
+            vec!["Windows Explorer"], None,
+        ),
+        (
+            rule("a12", "Steam (UDP-In)", false, "Inbound", "Allow", "Private, Public",
+                None, Some(r"C:\Program Files (x86)\Steam\steam.exe"), Some("UDP"), Some("27036"), None,
+                "Inbound rule created at application install for Steam local transfer."),
+            None, vec![], None,
         ),
     ];
 
-    let mut specs = specs;
-    specs[0].0.description =
-        Some("Outbound rule to allow DNS requests. DNS responses based on requests that \
-              matched this rule will be permitted regardless of source address."
-            .into());
-    specs[2].0.description =
-        Some("Inbound rule for the Remote Desktop service to allow RDP traffic. [TCP 3389]".into());
-
-    fn mock_listener(proto: &str, addr: &str, port: u32, pid: u32, name: &str, path: &str) -> Listener {
-        Listener {
-            proto: proto.into(),
-            local_address: addr.into(),
-            local_port: port,
-            pid,
-            process_name: name.into(),
-            process_path: path.into(),
-        }
-    }
     let mock_listeners = vec![
-        mock_listener("TCP", "0.0.0.0", 3389, 1104, "svchost", r"C:\Windows\System32\svchost.exe"),
-        mock_listener("TCP", "0.0.0.0", 445, 4, "System", ""),
-        mock_listener("TCP", "127.0.0.1", 9100, 5522, "printerutil", r"C:\Program Files\HP\printerutil.exe"),
-        mock_listener("UDP", "0.0.0.0", 5353, 7810, "chrome", r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
-        mock_listener("UDP", "0.0.0.0", 1900, 1220, "svchost", r"C:\Windows\System32\svchost.exe"),
-        mock_listener("TCP", "0.0.0.0", 135, 948, "svchost", r"C:\Windows\System32\svchost.exe"),
+        listener("TCP", "0.0.0.0", 3389, 1104, "svchost", r"C:\Windows\System32\svchost.exe"),
+        listener("TCP", "0.0.0.0", 445, 4, "System", ""),
+        listener("TCP", "0.0.0.0", 22, 5522, "sshd", r"C:\Windows\System32\OpenSSH\sshd.exe"),
+        listener("UDP", "0.0.0.0", 5353, 1220, "svchost", r"C:\Windows\System32\svchost.exe"),
+        listener("TCP", "0.0.0.0", 5985, 4, "System", ""),
+        listener("UDP", "0.0.0.0", 1900, 1220, "svchost", r"C:\Windows\System32\svchost.exe"),
+        listener("TCP", "127.0.0.1", 27060, 8100, "steam", r"C:\Program Files (x86)\Steam\steam.exe"),
     ];
 
     let rows = specs
         .into_iter()
-        .map(|(rule, usage, apps)| {
+        .map(|(rule, usage, apps, pending)| {
             let flags = baseline_checks::flags_for(&rule);
             let listening = listeners::listeners_for_rule(&rule, &mock_listeners);
-            let target_enabled = rule.is_enabled();
+            let target_enabled = pending.unwrap_or_else(|| rule.is_enabled());
             ui::RuleRow {
                 rule,
                 usage,
@@ -157,47 +172,55 @@ pub fn run() -> Result<()> {
         })
         .collect();
 
-    // what a ping/nmap session looks like: blocked traffic lands on WFP's
-    // built-in default block filters, not on firewall rules
+    // a ping/nmap session: blocked traffic lands on WFP built-in default
+    // block filters, which are not firewall rules
     let unmatched = vec![
-        UnmatchedRow {
-            filter_id: "68231".into(),
-            boot_session: "2026-07-14T07:58:03.1204418Z".into(),
-            filter_name: "Default Inbound Block".into(),
-            usage: RuleUsage {
-                rule_id: "unmatched:2026-07-14T07:58:03.1204418Z:68231".into(),
-                allow_count: 0,
-                block_count: 486,
-                first_seen: Some("2026-07-15T09:12:00.000Z".into()),
-                last_seen: Some("2026-07-15T09:14:31.000Z".into()),
-                apps: vec![("System".into(), 486)],
-            },
-        },
-        UnmatchedRow {
-            filter_id: "67810".into(),
-            boot_session: "2026-07-14T07:58:03.1204418Z".into(),
-            filter_name: "ICMP Echo Request v6 Default Block".into(),
-            usage: RuleUsage {
-                rule_id: "unmatched:2026-07-14T07:58:03.1204418Z:67810".into(),
-                allow_count: 0,
-                block_count: 37,
-                first_seen: Some("2026-07-15T09:10:02.000Z".into()),
-                last_seen: Some("2026-07-15T09:10:44.000Z".into()),
-                apps: vec![("System".into(), 37)],
-            },
-        },
+        unmatched_row("68231", "Default Inbound Block", 0, 486),
+        unmatched_row("67810", "ICMPv6 Echo Request Default Block", 0, 37),
+        unmatched_row("67122", "Query User Default (no rule matched)", 0, 61),
     ];
 
     ui::run_preview(
         rows,
         ui::AuditContext {
-            collection_started: Some("2026-07-01T08:00:00.000Z".into()),
-            last_ingest: Some("2026-07-15T18:45:12.000Z".into()),
-            events_processed: 184_232,
-            unmatched_events: 523,
+            hostname: "DC-EDGE-02".into(),
+            auditing_active: true,
+            collection_started: Some(iso_ago(15 * 24 * 60)),
+            last_ingest: Some(iso_ago(2)),
+            events_processed: 1_482_306,
+            unmatched_events: 1_204,
             note: String::new(),
         },
         unmatched,
         mock_listeners,
     )
+}
+
+fn listener(proto: &str, addr: &str, port: u32, pid: u32, name: &str, path: &str) -> Listener {
+    Listener {
+        proto: proto.into(),
+        local_address: addr.into(),
+        local_port: port,
+        pid,
+        process_name: name.into(),
+        process_path: path.into(),
+    }
+}
+
+fn unmatched_row(fid: &str, name: &str, allow: i64, block: i64) -> UnmatchedRow {
+    let boot = iso_ago(15 * 24 * 60);
+    UnmatchedRow {
+        filter_id: fid.into(),
+        boot_session: boot.clone(),
+        filter_name: name.into(),
+        usage: RuleUsage {
+            rule_id: format!("unmatched:{boot}:{fid}"),
+            allow_count: allow,
+            block_count: block,
+            first_seen: Some(iso_ago(300)),
+            last_seen: Some(iso_ago(120)),
+            apps: vec![("System".into(), block.max(allow))],
+            distinct_peers: 12,
+        },
+    }
 }

@@ -15,6 +15,8 @@ mod preview;
 mod secure_dir;
 mod store;
 mod syspath;
+mod theme;
+mod time_util;
 mod ui;
 
 use anyhow::{bail, Result};

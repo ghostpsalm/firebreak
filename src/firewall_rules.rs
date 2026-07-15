@@ -54,21 +54,27 @@ Get-NetFirewallPortFilter -All | ForEach-Object {
         RemotePort = (@($_.RemotePort) -join ',')
     }
 }
+$svcs = @{}
+Get-NetFirewallServiceFilter -All | ForEach-Object { $svcs[$_.InstanceID] = [string]$_.Service }
+$addrs = @{}
+Get-NetFirewallAddressFilter -All | ForEach-Object { $addrs[$_.InstanceID] = (@($_.RemoteAddress) -join ',') }
 $out = Get-NetFirewallRule | ForEach-Object {
     $p = $ports[$_.InstanceID]
     [pscustomobject]@{
-        Name        = $_.Name
-        DisplayName = $_.DisplayName
-        Description = $_.Description
-        Enabled     = [string]$_.Enabled
-        Direction   = [string]$_.Direction
-        Action      = [string]$_.Action
-        Profile     = [string]$_.Profile
-        Group       = $_.Group
-        Program     = $apps[$_.InstanceID]
-        Protocol    = $p.Protocol
-        LocalPort   = $p.LocalPort
-        RemotePort  = $p.RemotePort
+        Name          = $_.Name
+        DisplayName   = $_.DisplayName
+        Description   = $_.Description
+        Enabled       = [string]$_.Enabled
+        Direction     = [string]$_.Direction
+        Action        = [string]$_.Action
+        Profile       = [string]$_.Profile
+        Group         = $_.Group
+        Program       = $apps[$_.InstanceID]
+        Protocol      = $p.Protocol
+        LocalPort     = $p.LocalPort
+        RemotePort    = $p.RemotePort
+        Service       = $svcs[$_.InstanceID]
+        RemoteAddress = $addrs[$_.InstanceID]
     }
 }
 ConvertTo-Json -InputObject @($out) -Compress -Depth 3
@@ -114,6 +120,12 @@ pub fn backup_policy(rules: &[RuleInfo]) -> Result<PathBuf> {
 /// well under the 32,767-char Windows command-line limit even with long
 /// InstanceIDs, so a big batch can't fail wholesale after confirmation.
 const RULES_PER_INVOCATION: usize = 100;
+
+/// Enable/disable a single rule by unique Name (InstanceID) — the apply
+/// worker goes rule-by-rule so progress and per-rule failures are exact.
+pub fn set_rule_enabled(rule_name: &str, enabled: bool) -> Result<()> {
+    set_rules_enabled(std::slice::from_ref(&rule_name.to_string()), enabled)
+}
 
 /// Enable/disable rules by unique Name (InstanceID). Backup first — this
 /// module doesn't do it for you; the UI's Apply flow does. On error,
