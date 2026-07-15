@@ -284,6 +284,7 @@ pub fn parse_event_xml(xml: &str) -> Option<EventRecord> {
     let mut filter_rtid: Option<u64> = None;
     let mut application = String::new();
     let mut direction = String::new();
+    let mut filter_origin: Option<String> = None;
     let mut protocol: u32 = 0;
     let mut dest_address = String::new();
     let mut dest_port = String::new();
@@ -330,6 +331,12 @@ pub fn parse_event_xml(xml: &str) -> Option<EventRecord> {
                         "FilterRTID" => filter_rtid = text.parse().ok(),
                         "Application" => application = text,
                         "Direction" => direction = decode_direction(&text),
+                        // field name varies across builds; accept both
+                        "FilterOrigin" | "RuleName" => {
+                            if !text.trim().is_empty() && text != "-" {
+                                filter_origin = Some(text);
+                            }
+                        }
                         "Protocol" => protocol = text.parse().unwrap_or(0),
                         "DestAddress" => dest_address = text,
                         "DestPort" => dest_port = text,
@@ -367,6 +374,7 @@ pub fn parse_event_xml(xml: &str) -> Option<EventRecord> {
         filter_rtid,
         application,
         direction,
+        filter_origin,
         protocol,
         dest_address,
         dest_port,
@@ -406,6 +414,25 @@ mod tests {
         assert_eq!(ev.dest_port, "443");
         assert!(ev.application.ends_with("svchost.exe"));
         assert!(ev.is_allow());
+    }
+
+    #[test]
+    fn parses_filter_origin_when_present() {
+        // sample has no FilterOrigin field
+        assert_eq!(parse_event_xml(SAMPLE).unwrap().filter_origin, None);
+        let with_origin = SAMPLE.replace(
+            "<Data Name='FilterRTID'>67321</Data>",
+            "<Data Name='FilterRTID'>67321</Data><Data Name='FilterOrigin'>{aaaa-bbbb}</Data>",
+        );
+        assert_eq!(
+            parse_event_xml(&with_origin).unwrap().filter_origin.as_deref(),
+            Some("{aaaa-bbbb}")
+        );
+        let dash = SAMPLE.replace(
+            "<Data Name='FilterRTID'>67321</Data>",
+            "<Data Name='FilterRTID'>67321</Data><Data Name='FilterOrigin'>-</Data>",
+        );
+        assert_eq!(parse_event_xml(&dash).unwrap().filter_origin, None);
     }
 
     #[test]

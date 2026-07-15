@@ -189,16 +189,18 @@ pub fn build_filter_rule_map(
     filters: &[FilterInfo],
     rules: &[RuleInfo],
 ) -> HashMap<u64, (String, MappedVia)> {
-    // exact rule Name (InstanceID) lookup for providerData tokens
-    let by_name: HashMap<&str, &str> = rules
+    // exact rule Name (InstanceID) lookup for providerData tokens —
+    // case-insensitive: GUID hex case differs between WFP blobs and
+    // Get-NetFirewallRule output
+    let by_name: HashMap<String, &str> = rules
         .iter()
-        .map(|r| (r.name.as_str(), r.name.as_str()))
+        .map(|r| (r.name.to_lowercase(), r.name.as_str()))
         .collect();
-    // display name -> rule name, only when unambiguous
-    let mut by_display: HashMap<&str, Option<&str>> = HashMap::new();
+    // display name -> rule name, only when unambiguous (case-insensitive)
+    let mut by_display: HashMap<String, Option<&str>> = HashMap::new();
     for r in rules {
         by_display
-            .entry(r.display_name.as_str())
+            .entry(r.display_name.to_lowercase())
             .and_modify(|v| *v = None) // duplicate display name: ambiguous
             .or_insert(Some(r.name.as_str()));
     }
@@ -209,7 +211,7 @@ pub fn build_filter_rule_map(
         let mut matched: Option<(String, MappedVia)> = None;
         if !f.provider_data_utf16.is_empty() {
             for token in candidate_tokens(&f.provider_data_utf16) {
-                if let Some(name) = by_name.get(token) {
+                if let Some(name) = by_name.get(&token.to_lowercase()) {
                     matched = Some((name.to_string(), MappedVia::ProviderData));
                     break;
                 }
@@ -217,7 +219,7 @@ pub fn build_filter_rule_map(
         }
         // 2. unambiguous display-name match
         if matched.is_none() && !f.name.is_empty() {
-            if let Some(Some(rule_name)) = by_display.get(f.name.as_str()) {
+            if let Some(Some(rule_name)) = by_display.get(&f.name.to_lowercase()) {
                 matched = Some((rule_name.to_string(), MappedVia::DisplayName));
             }
         }

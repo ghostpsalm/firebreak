@@ -66,26 +66,57 @@ fn basename(p: &str) -> &str {
     p.rsplit(['\\', '/']).next().unwrap_or(p)
 }
 
-/// Which current listeners fall under an inbound rule's scope — by port
-/// (protocol + local port list; numeric entries only, ranges are skipped)
-/// or, when the rule is port-unrestricted, by program path/name.
+/// Parse a firewall LocalPort spec ("80", "5000-5020", "137,138,139",
+/// mixed) into inclusive ranges. Symbolic tokens (RPC, RPCEPMap,
+/// PlayToDiscovery, …) are unresolvable here and yield nothing — better no
+/// listener claim than a wrong one.
+fn parse_port_ranges(spec: &str) -> Vec<(u32, u32)> {
+    spec.split(',')
+        .filter_map(|entry| {
+            let entry = entry.trim();
+            if let Some((a, b)) = entry.split_once('-') {
+                match (a.trim().parse(), b.trim().parse()) {
+                    (Ok(a), Ok(b)) if a <= b => Some((a, b)),
+                    _ => None,
+                }
+            } else {
+                entry.parse().ok().map(|p| (p, p))
+            }
+        })
+        .collect()
+}
+
+/// Which current listeners fall under an inbound rule's scope. A firewall
+/// rule only admits traffic satisfying ALL of its conditions, so listener
+/// matching is a conjunction too: protocol AND local port (when specified,
+/// including ranges) AND program (when specified). A rule with neither
+/// ports nor program ("Any") claims no listeners — the Scope column
+/// already says Any, and listing every socket would be noise.
 pub fn listeners_for_rule(rule: &RuleInfo, listeners: &[Listener]) -> Vec<String> {
     if !rule.direction.eq_ignore_ascii_case("inbound") {
         return Vec::new();
     }
     let rule_proto = rule.protocol.as_deref().unwrap_or("Any");
-    let ports: Vec<u32> = rule
+    let port_spec = rule
         .local_port
         .as_deref()
-        .unwrap_or("")
-        .split(',')
-        .filter_map(|p| p.trim().parse().ok())
-        .collect();
+        .map(str::trim)
+        .filter(|p| !p.is_empty() && !p.eq_ignore_ascii_case("any"));
+    let port_ranges = port_spec.map(parse_port_ranges);
     let program = rule
         .program
         .as_deref()
         .filter(|p| !p.is_empty() && !p.eq_ignore_ascii_case("any"))
         .map(expand_program_path);
+
+    // nothing to scope on, or a port spec we can't resolve (symbolic like
+    // RPC): claim nothing rather than over-claim
+    if port_spec.is_none() && program.is_none() {
+        return Vec::new();
+    }
+    if matches!(&port_ranges, Some(r) if r.is_empty()) {
+        return Vec::new();
+    }
 
     let mut out = Vec::new();
     for l in listeners {
@@ -94,19 +125,18 @@ pub fn listeners_for_rule(rule: &RuleInfo, listeners: &[Listener]) -> Vec<String
         if !proto_ok {
             continue;
         }
-        let port_hit = ports.contains(&l.local_port);
-        let program_hit = match &program {
+        let port_ok = match &port_ranges {
+            Some(ranges) => ranges.iter().any(|&(a, b)| l.local_port >= a && l.local_port <= b),
+            None => true, // no port condition on the rule
+        };
+        let program_ok = match &program {
             Some(prog) => {
                 let lp = l.process_path.to_lowercase();
-                !lp.is_empty()
-                    && (lp == *prog || basename(&lp) == basename(prog))
+                !lp.is_empty() && (lp == *prog || basename(&lp) == basename(prog))
             }
-            None => false,
+            None => true, // no program condition on the rule
         };
-        // port-scoped rules match on port; port-unrestricted program rules
-        // match on the owning process
-        let hit = if !ports.is_empty() { port_hit } else { program_hit };
-        if hit {
+        if port_ok && program_ok {
             let name = if l.process_name.is_empty() {
                 format!("pid {}", l.pid)
             } else {
@@ -190,6 +220,36 @@ mod tests {
         ];
         let r = rule("Inbound", Some("TCP"), Some("3389"), None);
         assert_eq!(listeners_for_rule(&r, &ls), vec!["svchost :3389/TCP"]);
+    }
+
+    #[test]
+    fn program_and_port_rule_requires_both_to_match() {
+        // regression: an svchost rule scoped to 5000-5020 must not claim
+        // every port svchost listens on
+        let svchost = r"C:\Windows\System32\svchost.exe";
+        let ls = vec![
+            listener("TCP", 135, "svchost", svchost),
+            listener("TCP", 5010, "svchost", svchost),
+            listener("TCP", 5010, "other", r"C:\other.exe"),
+        ];
+        let r = rule("Inbound", Some("TCP"), Some("5000-5020"), Some(svchost));
+        assert_eq!(listeners_for_rule(&r, &ls), vec!["svchost :5010/TCP"]);
+    }
+
+    #[test]
+    fn port_ranges_and_lists_parse() {
+        assert_eq!(parse_port_ranges("5000-5020"), vec![(5000, 5020)]);
+        assert_eq!(parse_port_ranges("137,138,139"), vec![(137, 137), (138, 138), (139, 139)]);
+        assert_eq!(parse_port_ranges("80,8000-8080"), vec![(80, 80), (8000, 8080)]);
+        assert!(parse_port_ranges("RPC").is_empty());
+    }
+
+    #[test]
+    fn symbolic_port_spec_claims_no_listeners() {
+        let svchost = r"C:\Windows\System32\svchost.exe";
+        let ls = vec![listener("TCP", 135, "svchost", svchost)];
+        let r = rule("Inbound", Some("TCP"), Some("RPC"), Some(svchost));
+        assert!(listeners_for_rule(&r, &ls).is_empty());
     }
 
     #[test]

@@ -376,6 +376,7 @@ mod tests {
             filter_rtid: rtid,
             application: r"\device\hd1\a.exe".into(),
             direction: "Outbound".into(),
+            filter_origin: None,
             protocol: 6,
             dest_address: "1.2.3.4".into(),
             dest_port: "443".into(),

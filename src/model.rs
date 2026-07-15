@@ -90,6 +90,11 @@ pub struct EventRecord {
     pub application: String,
     /// "Inbound" / "Outbound" / raw token if unrecognized
     pub direction: String,
+    /// Newer Windows 10/11 builds embed the filter's origin directly in
+    /// the event: a firewall rule ID, or a policy origin like "Stealth",
+    /// "Boot Time Default", "Query User Default", "WSH Default". When it
+    /// names a rule, it's the most authoritative attribution available.
+    pub filter_origin: Option<String>,
     pub protocol: u32,
     pub dest_address: String,
     pub dest_port: String,

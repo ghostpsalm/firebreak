@@ -202,6 +202,11 @@ pub fn analyze(db_path: &Path, progress: &dyn Fn(&str)) -> Result<AnalysisResult
 
     progress("Ingesting Security log events…");
     let device_map = app_identity::device_path_map();
+    // case-insensitive rule-name index for FilterOrigin attribution
+    let rule_names_ci: std::collections::HashMap<String, String> = rules
+        .iter()
+        .map(|r| (r.name.to_lowercase(), r.name.clone()))
+        .collect();
     let mut events_processed: u64 = 0;
     let mut unmatched_events: u64 = 0;
     let mut max_record_id: Option<u64> = None;
@@ -209,20 +214,32 @@ pub fn analyze(db_path: &Path, progress: &dyn Fn(&str)) -> Result<AnalysisResult
     // filter IDs repeat heavily across events; cache DB lookups for the run
     let mut historical_memo: std::collections::HashMap<(u64, String), Option<String>> =
         std::collections::HashMap::new();
+    // non-rule FilterOrigin values seen per unmatched bucket, to explain
+    // them in the report ("Stealth", "Query User Default", …)
+    let mut unmatched_origins: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
 
     let ingest = event_query::query_events(checkpoint, |ev| {
         events_processed += 1;
         if max_record_id.map_or(true, |m| ev.record_id > m) {
             max_record_id = Some(ev.record_id);
         }
+        // most authoritative first: newer Windows builds put the rule ID
+        // (or a policy-origin token) straight into the event
+        let origin_hit = ev
+            .filter_origin
+            .as_ref()
+            .and_then(|o| rule_names_ci.get(&o.to_lowercase()).cloned());
         let session = session_of(&ev.time_created);
-        // current-boot events use the live enumeration; everything else (and
-        // live filters since deleted) goes through the per-session DB map
-        let current_hit = if session == current_boot {
-            rule_map.get(&ev.filter_rtid).map(|(id, _)| id.clone())
-        } else {
-            None
-        };
+        // then the live enumeration for current-boot events; everything
+        // else (and live filters since deleted) via the per-session DB map
+        let current_hit = origin_hit.or_else(|| {
+            if session == current_boot {
+                rule_map.get(&ev.filter_rtid).map(|(id, _)| id.clone())
+            } else {
+                None
+            }
+        });
         let rule_id = match current_hit {
             Some(id) => id,
             None => {
@@ -237,7 +254,13 @@ pub fn analyze(db_path: &Path, progress: &dyn Fn(&str)) -> Result<AnalysisResult
                     Some(id) => id.clone(),
                     None => {
                         unmatched_events += 1;
-                        format!("unmatched:{}:{}", session, ev.filter_rtid)
+                        let pseudo = format!("unmatched:{}:{}", session, ev.filter_rtid);
+                        if let Some(origin) = &ev.filter_origin {
+                            unmatched_origins
+                                .entry(pseudo.clone())
+                                .or_insert_with(|| origin.clone());
+                        }
+                        pseudo
                     }
                 }
             }
@@ -313,10 +336,17 @@ pub fn analyze(db_path: &Path, progress: &dyn Fn(&str)) -> Result<AnalysisResult
             // rule_id shape: unmatched:<boot_session>:<filter_id>
             let rest = usage.rule_id.strip_prefix("unmatched:").unwrap_or("");
             let (session, fid) = rest.rsplit_once(':').unwrap_or(("", rest));
+            // best explanation available: the enumerated filter's name,
+            // else the event's own FilterOrigin token, else honesty
             let filter_name = fid
                 .parse::<u64>()
                 .ok()
                 .and_then(|id| filter_names.get(&(id, session.to_string())).cloned())
+                .or_else(|| {
+                    unmatched_origins
+                        .get(&usage.rule_id)
+                        .map(|o| format!("origin: {o}"))
+                })
                 .unwrap_or_else(|| "(filter not recorded — likely from a boot with no firebreak run)".to_string());
             UnmatchedRow {
                 filter_id: fid.to_string(),
