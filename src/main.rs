@@ -14,6 +14,7 @@ mod pipeline;
 mod preview;
 mod secure_dir;
 mod store;
+mod support;
 mod syspath;
 mod theme;
 mod time_util;
@@ -27,6 +28,7 @@ struct Args {
     enable_only: bool,
     no_ui: bool,
     dump_filters: bool,
+    export_support: bool,
     ui_preview: bool,
     restore_audit: bool,
     db_path: std::path::PathBuf,
@@ -37,6 +39,7 @@ fn parse_args() -> Args {
         enable_only: false,
         no_ui: false,
         dump_filters: false,
+        export_support: false,
         ui_preview: false,
         restore_audit: false,
         db_path: store::default_db_path(),
@@ -47,6 +50,7 @@ fn parse_args() -> Args {
             "--enable-only" => args.enable_only = true,
             "--no-ui" => args.no_ui = true,
             "--dump-filters" => args.dump_filters = true,
+            "--export-support" => args.export_support = true,
             "--ui-preview" => args.ui_preview = true,
             "--restore-audit" => args.restore_audit = true,
             "--db" => match it.next() {
@@ -67,6 +71,8 @@ fn parse_args() -> Args {
                      \x20 --no-ui          ingest and print a text report instead of the UI\n\
                      \x20 --dump-filters   dump the live WFP filter table (for verifying\n\
                      \x20                  the filter->rule mapping) and exit\n\
+                     \x20 --export-support write a full diagnostic bundle to the Desktop\n\
+                     \x20                  (audit state, rules, filters, event attribution probe)\n\
                      \x20 --restore-audit  restore the audit policy and Security log size\n\
                      \x20                  recorded before firebreak first changed them\n\
                      \x20 --ui-preview     open the UI with mock data (no elevation needed)\n\
@@ -107,6 +113,13 @@ fn main() -> Result<()> {
 
     if args.dump_filters {
         return dump_filters();
+    }
+    if args.export_support {
+        let path = support::default_path();
+        support::export(&path)?;
+        println!("Support bundle written to:\n  {}", path.display());
+        println!("Review/redact if needed, then send it back for diagnosis.");
+        return Ok(());
     }
     if args.restore_audit {
         let store = Store::open(&args.db_path)?;

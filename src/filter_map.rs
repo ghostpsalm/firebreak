@@ -148,7 +148,7 @@ const MIN_TOKEN_LEN: usize = 4;
 /// Anchored token equality instead of substring `contains` — a rule named
 /// "e" must not swallow every filter — and it turns the O(filters × rules)
 /// scan into O(filters × tokens) hash lookups.
-fn candidate_tokens(text: &str) -> Vec<&str> {
+pub fn candidate_tokens(text: &str) -> Vec<&str> {
     let mut out = Vec::new();
     // brace-delimited spans
     let mut rest = text;

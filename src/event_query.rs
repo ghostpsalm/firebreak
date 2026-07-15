@@ -153,6 +153,37 @@ pub fn query_events(
     bail!("event log query is only available on Windows")
 }
 
+/// Raw rendered XML of the most recent `limit` 5156/5157 events (newest
+/// first) — for the --diagnose report, which needs the raw field names and
+/// values, not the parsed subset.
+#[cfg(windows)]
+pub fn recent_event_xml(limit: usize) -> Result<Vec<String>> {
+    let result_set = win::open_query("Security", &build_query(None), false)?;
+    let mut out = Vec::new();
+    let mut buf = Vec::new();
+    'outer: loop {
+        let mut handles = [0isize; 64];
+        let returned = win::next_batch(&result_set, &mut handles)?;
+        if returned == 0 {
+            break;
+        }
+        for &raw in handles.iter().take(returned as usize) {
+            if let Some(xml) = win::render_xml(raw, &mut buf) {
+                out.push(xml);
+                if out.len() >= limit {
+                    break 'outer;
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(not(windows))]
+pub fn recent_event_xml(_limit: usize) -> Result<Vec<String>> {
+    bail!("event log query is only available on Windows")
+}
+
 /// First event XML matching `xpath`, from either end of the channel.
 #[cfg(windows)]
 fn first_xml(channel: &str, xpath: &str, forward: bool) -> Result<Option<String>> {
