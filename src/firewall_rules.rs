@@ -110,24 +110,37 @@ pub fn backup_policy(rules: &[RuleInfo]) -> Result<PathBuf> {
     Ok(wfw)
 }
 
+/// Names per Set-NetFirewallRule invocation: keeps the -EncodedCommand
+/// well under the 32,767-char Windows command-line limit even with long
+/// InstanceIDs, so a big batch can't fail wholesale after confirmation.
+const RULES_PER_INVOCATION: usize = 100;
+
 /// Enable/disable rules by unique Name (InstanceID). Backup first — this
-/// module doesn't do it for you; the UI's Apply flow does.
+/// module doesn't do it for you; the UI's Apply flow does. On error,
+/// reports how many rules had already been applied.
 pub fn set_rules_enabled(rule_names: &[String], enabled: bool) -> Result<()> {
-    if rule_names.is_empty() {
-        return Ok(());
-    }
-    let list = rule_names
-        .iter()
-        .map(|n| format!("'{}'", n.replace('\'', "''")))
-        .collect::<Vec<_>>()
-        .join(",");
     let value = if enabled { "True" } else { "False" };
-    let script = format!(
-        r#"
+    let mut applied = 0usize;
+    for chunk in rule_names.chunks(RULES_PER_INVOCATION) {
+        let list = chunk
+            .iter()
+            .map(|n| format!("'{}'", n.replace('\'', "''")))
+            .collect::<Vec<_>>()
+            .join(",");
+        let script = format!(
+            r#"
 $ErrorActionPreference = 'Stop'
 Set-NetFirewallRule -Name @({list}) -Enabled {value}
 "#
-    );
-    run_powershell(&script)?;
+        );
+        run_powershell(&script).with_context(|| {
+            format!(
+                "setting Enabled={value}: {applied} of {} rules were applied before this \
+                 chunk failed",
+                rule_names.len()
+            )
+        })?;
+        applied += chunk.len();
+    }
     Ok(())
 }

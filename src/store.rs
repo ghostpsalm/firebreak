@@ -118,6 +118,12 @@ impl Store {
         Ok(())
     }
 
+    pub fn delete_meta(&self, key: &str) -> Result<()> {
+        let mut stmt = self.conn.prepare_cached("DELETE FROM meta WHERE key = ?1")?;
+        stmt.execute(params![key])?;
+        Ok(())
+    }
+
     /// Last-processed EventRecordID (Security channel). The next ingest
     /// resumes strictly after this record.
     pub fn checkpoint_record_id(&self) -> Result<Option<u64>> {

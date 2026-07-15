@@ -64,16 +64,18 @@ pub fn query_audit_state() -> Result<AuditState> {
     bail!("audit policy query is only available on Windows")
 }
 
-/// Enable success+failure auditing for Filtering Platform Connection.
+/// Set Filtering Platform Connection auditing to an explicit state — used
+/// both to enable collection and to restore the pre-firebreak state.
 /// Note: local audit policy can be overridden by GPO on the next policy
 /// refresh — if this flips back off between runs, that's the place to look.
-pub fn enable_auditing() -> Result<()> {
+pub fn set_auditing(state: AuditState) -> Result<()> {
+    let onoff = |b: bool| if b { "enable" } else { "disable" };
     let out = Command::new(crate::syspath::system32_tool("auditpol.exe"))
         .args([
             "/set",
             &format!("/subcategory:{}", FILTERING_PLATFORM_CONNECTION_GUID),
-            "/success:enable",
-            "/failure:enable",
+            &format!("/success:{}", onoff(state.success)),
+            &format!("/failure:{}", onoff(state.failure)),
         ])
         .output()
         .context("running auditpol.exe")?;
@@ -85,6 +87,13 @@ pub fn enable_auditing() -> Result<()> {
         );
     }
     Ok(())
+}
+
+pub fn enable_auditing() -> Result<()> {
+    set_auditing(AuditState {
+        success: true,
+        failure: true,
+    })
 }
 
 /// Current max size of the Security log in bytes, via wevtutil gl.
@@ -106,16 +115,10 @@ pub fn security_log_max_bytes() -> Result<u64> {
     bail!("maxSize not found in wevtutil output");
 }
 
-/// Grow the Security log if it's below `min_bytes`. Never shrinks.
-/// Connection auditing is per-connection (not per-packet) but still chatty;
-/// the log has to hold everything between on-demand runs of this tool.
-pub fn ensure_security_log_size(min_bytes: u64) -> Result<bool> {
-    let current = security_log_max_bytes()?;
-    if current >= min_bytes {
-        return Ok(false);
-    }
+/// Set the Security log max size (bytes).
+pub fn set_security_log_max_bytes(bytes: u64) -> Result<()> {
     let out = Command::new(crate::syspath::system32_tool("wevtutil.exe"))
-        .args(["sl", "Security", &format!("/ms:{}", min_bytes)])
+        .args(["sl", "Security", &format!("/ms:{}", bytes)])
         .output()
         .context("running wevtutil sl Security")?;
     if !out.status.success() {
@@ -124,7 +127,7 @@ pub fn ensure_security_log_size(min_bytes: u64) -> Result<bool> {
             String::from_utf8_lossy(&out.stderr)
         );
     }
-    Ok(true)
+    Ok(())
 }
 
 /// Default target: 512 MiB. At a few hundred bytes per 5156 event this holds

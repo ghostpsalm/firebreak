@@ -27,6 +27,7 @@ struct Args {
     no_ui: bool,
     dump_filters: bool,
     ui_preview: bool,
+    restore_audit: bool,
     db_path: std::path::PathBuf,
 }
 
@@ -36,6 +37,7 @@ fn parse_args() -> Args {
         no_ui: false,
         dump_filters: false,
         ui_preview: false,
+        restore_audit: false,
         db_path: store::default_db_path(),
     };
     let mut it = std::env::args().skip(1);
@@ -45,6 +47,7 @@ fn parse_args() -> Args {
             "--no-ui" => args.no_ui = true,
             "--dump-filters" => args.dump_filters = true,
             "--ui-preview" => args.ui_preview = true,
+            "--restore-audit" => args.restore_audit = true,
             "--db" => match it.next() {
                 Some(p) => args.db_path = p.into(),
                 None => {
@@ -63,6 +66,9 @@ fn parse_args() -> Args {
                      \x20 --no-ui          ingest and print a text report instead of the UI\n\
                      \x20 --dump-filters   dump the live WFP filter table (for verifying\n\
                      \x20                  the filter->rule mapping) and exit\n\
+                     \x20 --restore-audit  restore the audit policy and Security log size\n\
+                     \x20                  recorded before firebreak first changed them\n\
+                     \x20 --ui-preview     open the UI with mock data (no elevation needed)\n\
                      \x20 --db <path>      database path (default %ProgramData%\\firebreak\\firebreak.db)"
                 );
                 std::process::exit(0);
@@ -96,6 +102,10 @@ fn main() -> Result<()> {
 
     let store = Store::open(&args.db_path)?;
 
+    if args.restore_audit {
+        return restore_audit(&store);
+    }
+
     // ---- mode detection: is auditing on? ----
     let audit_state = audit_control::query_audit_state()?;
     let mut note = String::new();
@@ -104,14 +114,31 @@ fn main() -> Result<()> {
             "Filtering Platform Connection auditing is not (fully) enabled — enabling now. \
              Collection starts from this moment; there is no retroactive data."
         );
+        // record what we're about to change, once, so --restore-audit can
+        // put the host back exactly as found
+        if store.get_meta("prior_audit_success")?.is_none() {
+            store.set_meta("prior_audit_success", &audit_state.success.to_string())?;
+            store.set_meta("prior_audit_failure", &audit_state.failure.to_string())?;
+        }
         audit_control::enable_auditing()?;
-        match audit_control::ensure_security_log_size(audit_control::DEFAULT_SECURITY_LOG_BYTES) {
-            Ok(true) => println!(
-                "Security log max size raised to {} MiB.",
-                audit_control::DEFAULT_SECURITY_LOG_BYTES / 1024 / 1024
-            ),
-            Ok(false) => {}
-            Err(e) => eprintln!("warning: could not resize Security log: {e:#}"),
+        match audit_control::security_log_max_bytes() {
+            Ok(current) => {
+                if current < audit_control::DEFAULT_SECURITY_LOG_BYTES {
+                    if store.get_meta("prior_log_max_bytes")?.is_none() {
+                        store.set_meta("prior_log_max_bytes", &current.to_string())?;
+                    }
+                    match audit_control::set_security_log_max_bytes(
+                        audit_control::DEFAULT_SECURITY_LOG_BYTES,
+                    ) {
+                        Ok(()) => println!(
+                            "Security log max size raised to {} MiB.",
+                            audit_control::DEFAULT_SECURITY_LOG_BYTES / 1024 / 1024
+                        ),
+                        Err(e) => eprintln!("warning: could not resize Security log: {e:#}"),
+                    }
+                }
+            }
+            Err(e) => eprintln!("warning: could not read Security log size: {e:#}"),
         }
         let now = now_iso();
         if store.get_meta("collection_started")?.is_none() {
@@ -460,6 +487,41 @@ fn ui_preview() -> Result<()> {
             note: String::new(),
         },
     )
+}
+
+/// Put the host's audit configuration back to what was recorded before
+/// firebreak first changed it (S-06): audit subcategory state and Security
+/// log size. Collected usage data is left untouched.
+fn restore_audit(store: &Store) -> Result<()> {
+    let success = store.get_meta("prior_audit_success")?;
+    let failure = store.get_meta("prior_audit_failure")?;
+    match (success, failure) {
+        (Some(s), Some(f)) => {
+            let state = audit_control::AuditState {
+                success: s == "true",
+                failure: f == "true",
+            };
+            audit_control::set_auditing(state)?;
+            println!(
+                "Audit policy restored (success={}, failure={}).",
+                state.success, state.failure
+            );
+            store.delete_meta("prior_audit_success")?;
+            store.delete_meta("prior_audit_failure")?;
+        }
+        _ => println!(
+            "No prior audit state recorded — firebreak never changed the audit policy \
+             on this host (or it was already restored). Leaving it as is."
+        ),
+    }
+    if let Some(bytes) = store.get_meta("prior_log_max_bytes")? {
+        if let Ok(bytes) = bytes.parse::<u64>() {
+            audit_control::set_security_log_max_bytes(bytes)?;
+            println!("Security log max size restored to {} bytes.", bytes);
+        }
+        store.delete_meta("prior_log_max_bytes")?;
+    }
+    Ok(())
 }
 
 fn dump_filters() -> Result<()> {
