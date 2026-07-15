@@ -79,10 +79,10 @@ ConvertTo-Json -InputObject @($out) -Compress -Depth 3
     Ok(rules)
 }
 
-/// Directory where backups land: %ProgramData%\fwaudit\backups
+/// Directory where backups land: %ProgramData%\firebreak\backups
 pub fn backup_dir() -> PathBuf {
     let base = std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into());
-    Path::new(&base).join("fwaudit").join("backups")
+    Path::new(&base).join("firebreak").join("backups")
 }
 
 /// Export the full firewall policy before any mutation. Produces a

@@ -374,7 +374,7 @@ pub fn run(rows: Vec<RuleRow>, ctx_info: AuditContext) -> anyhow::Result<()> {
         ..Default::default()
     };
     eframe::run_native(
-        "fwaudit",
+        "firebreak",
         options,
         Box::new(move |_cc| Ok(Box::new(App::new(rows, ctx_info)))),
     )

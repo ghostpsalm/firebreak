@@ -1,4 +1,4 @@
-# fwaudit — Windows Firewall rule-usage auditor
+# firebreak — Windows Firewall rule-usage auditor
 
 On-demand tool (no service, no driver) that answers: **which firewall rules
 are actually being matched, by which applications, and how often** — so
@@ -27,7 +27,7 @@ Run **elevated**. Modes are auto-detected:
 2. **Auditing already on, first run of the tool:** ingests whatever history
    the Security log still holds.
 3. **Normal run:** ingests events since the last checkpoint, aggregates
-   per-rule usage into `%ProgramData%\fwaudit\fwaudit.db`, and opens the UI.
+   per-rule usage into `%ProgramData%\firebreak\firebreak.db`, and opens the UI.
 
 Flags: `--enable-only`, `--no-ui` (text report), `--dump-filters`
 (diagnostics, see below), `--db <path>`.
@@ -36,7 +36,7 @@ The UI lists every rule with allow/block hit counts, last-seen time, the
 applications observed hitting it (friendly names from PE version info), and
 static baseline flags (mDNS/SSDP/LLMNR/RDP/SMB/broad-allow…). Checkboxes set
 the intended enabled-state; **Apply** first writes a full policy backup to
-`%ProgramData%\fwaudit\backups\firewall-<stamp>.wfw` (restore with
+`%ProgramData%\firebreak\backups\firewall-<stamp>.wfw` (restore with
 `netsh advfirewall import <file>`) plus a JSON rule dump, then commits via
 `Set-NetFirewallRule`.
 
@@ -62,7 +62,7 @@ compiles and the event parser has test coverage, but the following are from
 documentation/memory and are the first things to verify; all are cheap to
 adjust:
 
-1. **Filter→rule mapping (the load-bearing one).** Run `fwaudit
+1. **Filter→rule mapping (the load-bearing one).** Run `firebreak
    --dump-filters`, take a `FilterRTID` from a real 5156 event (Event
    Viewer → Security), and check what the matching filter's
    `provider_data_utf16` actually contains. Matching currently tries

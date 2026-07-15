@@ -8,11 +8,11 @@ pub struct Store {
     conn: Connection,
 }
 
-/// Default DB location: %ProgramData%\fwaudit\fwaudit.db (survives per-user
+/// Default DB location: %ProgramData%\firebreak\firebreak.db (survives per-user
 /// profile churn; tool runs elevated anyway).
 pub fn default_db_path() -> PathBuf {
     let base = std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into());
-    Path::new(&base).join("fwaudit").join("fwaudit.db")
+    Path::new(&base).join("firebreak").join("firebreak.db")
 }
 
 impl Store {

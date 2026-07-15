@@ -50,7 +50,7 @@ fn parse_args() -> Args {
             }
             "--help" | "-h" => {
                 println!(
-                    "fwaudit — Windows Firewall rule-usage auditor\n\n\
+                    "firebreak — Windows Firewall rule-usage auditor\n\n\
                      Modes are auto-detected: first run enables WFP connection auditing\n\
                      and starts the collection clock; later runs ingest new 5156/5157\n\
                      events, correlate them to firewall rules, and open the report UI.\n\n\
@@ -59,7 +59,7 @@ fn parse_args() -> Args {
                      \x20 --no-ui          ingest and print a text report instead of the UI\n\
                      \x20 --dump-filters   dump the live WFP filter table (for verifying\n\
                      \x20                  the filter->rule mapping) and exit\n\
-                     \x20 --db <path>      database path (default %ProgramData%\\fwaudit\\fwaudit.db)"
+                     \x20 --db <path>      database path (default %ProgramData%\\firebreak\\firebreak.db)"
                 );
                 std::process::exit(0);
             }
@@ -81,7 +81,7 @@ fn main() -> Result<()> {
 
     if !elevation::is_elevated() {
         bail!(
-            "fwaudit must run elevated (audit policy, Security log and WFP access all \
+            "firebreak must run elevated (audit policy, Security log and WFP access all \
              require it). Right-click -> Run as administrator, or start from an elevated terminal."
         );
     }
@@ -130,7 +130,7 @@ fn main() -> Result<()> {
             audit_control::FILTERING_PLATFORM_CONNECTION_GUID
         );
         if args.enable_only {
-            println!("--enable-only: done. Run fwaudit again later to analyze.");
+            println!("--enable-only: done. Run firebreak again later to analyze.");
             return Ok(());
         }
         note = "Collection just started — usage data will be empty until traffic accumulates."

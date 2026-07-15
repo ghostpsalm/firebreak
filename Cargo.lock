@@ -1137,6 +1137,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
+name = "firebreak"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "chrono",
+ "eframe",
+ "egui",
+ "egui_extras",
+ "quick-xml 0.36.2",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "windows 0.58.0",
+]
+
+[[package]]
 name = "flate2"
 version = "1.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1250,23 +1267,6 @@ dependencies = [
  "memchr",
  "pin-project-lite",
  "slab",
-]
-
-[[package]]
-name = "fwaudit"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64",
- "chrono",
- "eframe",
- "egui",
- "egui_extras",
- "quick-xml 0.36.2",
- "rusqlite",
- "serde",
- "serde_json",
- "windows 0.58.0",
 ]
 
 [[package]]
