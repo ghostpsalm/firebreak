@@ -1,1 +1,4 @@
 /target
+
+# internal code-review reports — not for publication
+CODE_REVIEW_*.md
