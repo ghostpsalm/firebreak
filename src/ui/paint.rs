@@ -675,17 +675,22 @@ fn firstrun_band(app: &mut App, ctx: &egui::Context) {
                     app.start_enable(ctx);
                 }
                 ui.add_space(16.0);
-                let mut job = egui::text::LayoutJob::default();
-                job.wrap.max_width = ui.available_width();
-                job.append(
-                    "Turns on Windows Filtering Platform audit events (security log, ~40 MB/day at typical load). ",
-                    0.0, fmt(t::sans(12.0), t::INK));
-                job.append("Nothing is blocked or modified", 0.0, fmt(t::semibold(12.0), t::INK));
-                job.append(
-                    " — firebreak only records which rules the traffic matches. Usage columns fill in as evidence \
-                     accumulates; plan on ~7–14 days before zero-hit values mean anything.",
-                    0.0, fmt(t::sans(12.0), t::INK));
-                ui.label(job);
+                // constrain the explainer to the space left of the buttons so
+                // it wraps instead of running off the window
+                let w = (ui.available_width() - 8.0).max(120.0);
+                ui.allocate_ui_with_layout(Vec2::new(w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                    let mut job = egui::text::LayoutJob::default();
+                    job.wrap.max_width = w;
+                    job.append(
+                        "Turns on Windows Filtering Platform audit events (security log, ~40 MB/day at typical load). ",
+                        0.0, fmt(t::sans(12.0), t::INK));
+                    job.append("Nothing is blocked or modified", 0.0, fmt(t::semibold(12.0), t::INK));
+                    job.append(
+                        " — firebreak only records which rules the traffic matches. Usage columns fill in as evidence \
+                         accumulates; plan on ~7–14 days before zero-hit values mean anything.",
+                        0.0, fmt(t::sans(12.0), t::INK));
+                    ui.label(job);
+                });
             });
         });
 }
@@ -1365,13 +1370,22 @@ fn detail_panel(app: &mut App, ctx: &egui::Context) {
             let r = &app.rows[ri];
             egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
                 ui.add_space(12.0);
-                ui.horizontal(|ui| {
+                ui.horizontal_top(|ui| {
                     ui.add_space(14.0);
-                    ui.label(egui::RichText::new(&r.rule.display_name).font(t::semibold(13.0)).color(t::INK));
+                    // close button first (reserved on the right), then the
+                    // title wrapping in the remaining width
+                    let avail = ui.available_width();
+                    ui.allocate_ui_with_layout(Vec2::new(avail - 30.0, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                        ui.add(egui::Label::new(egui::RichText::new(&r.rule.display_name).font(t::semibold(13.0)).color(t::INK)).wrap());
+                    });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                         ui.add_space(14.0);
-                        let (r, resp) = ui.allocate_exact_size(Vec2::splat(14.0), Sense::click());
-                        glyph::cross(ui.painter(), r.center(), 10.0, if resp.hovered() { t::INK } else { t::FAINT });
+                        let (cr, resp) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::click());
+                        if resp.hovered() {
+                            ui.painter().rect_filled(cr.expand(2.0), 0.0, t::HOVER_WASH);
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        glyph::cross(ui.painter(), cr.center(), 11.0, if resp.hovered() { t::INK } else { t::FAINT });
                         if resp.clicked() {
                             app.selected = None;
                         }
@@ -1470,11 +1484,12 @@ fn detail_panel(app: &mut App, ctx: &egui::Context) {
 }
 
 fn pad_label(ui: &mut egui::Ui, text: egui::RichText) {
-    ui.horizontal_wrapped(|ui| {
+    ui.horizontal_top(|ui| {
         ui.add_space(14.0);
-        ui.spacing_mut().item_spacing.x = 0.0;
-        ui.set_max_width(272.0);
-        ui.label(text);
+        let w = (ui.available_width() - 14.0).max(80.0); // leave 14 on the right
+        ui.allocate_ui_with_layout(Vec2::new(w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+            ui.add(egui::Label::new(text).wrap());
+        });
     });
 }
 
