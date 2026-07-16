@@ -32,6 +32,7 @@ struct Args {
     export_support: bool,
     ui_preview: bool,
     restore_audit: bool,
+    reset: bool,
     db_path: std::path::PathBuf,
 }
 
@@ -43,6 +44,7 @@ fn parse_args() -> Args {
         export_support: false,
         ui_preview: false,
         restore_audit: false,
+        reset: false,
         db_path: store::default_db_path(),
     };
     let mut it = std::env::args().skip(1);
@@ -54,6 +56,7 @@ fn parse_args() -> Args {
             "--export-support" => args.export_support = true,
             "--ui-preview" => args.ui_preview = true,
             "--restore-audit" => args.restore_audit = true,
+            "--reset" => args.reset = true,
             "--db" => match it.next() {
                 Some(p) => args.db_path = p.into(),
                 None => {
@@ -76,6 +79,8 @@ fn parse_args() -> Args {
                      \x20                  (audit state, rules, filters, event attribution probe)\n\
                      \x20 --restore-audit  restore the audit policy and Security log size\n\
                      \x20                  recorded before firebreak first changed them\n\
+                     \x20 --reset          clear collected usage + checkpoint; next run\n\
+                     \x20                  re-scans the whole Security log\n\
                      \x20 --ui-preview     open the UI with mock data (no elevation needed)\n\
                      \x20 --db <path>      database path (default %ProgramData%\\firebreak\\firebreak.db)"
                 );
@@ -125,6 +130,11 @@ fn main() -> Result<()> {
     if args.restore_audit {
         let store = Store::open(&args.db_path)?;
         return restore_audit(&store);
+    }
+    if args.reset {
+        pipeline::reset(&args.db_path)?;
+        println!("Cleared usage data and checkpoint. The next run re-scans the whole Security log.");
+        return Ok(());
     }
     if args.enable_only {
         pipeline::enable_collection(&args.db_path, &|s: &str| println!("{s}"))?;

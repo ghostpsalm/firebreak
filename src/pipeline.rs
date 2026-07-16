@@ -77,6 +77,12 @@ pub fn audit_enabled() -> Result<bool> {
     Ok(audit_control::query_audit_state()?.fully_enabled())
 }
 
+/// Clear aggregated usage + checkpoint so the next run re-scans the whole
+/// Security log. Manual counterpart to the automatic model-change reset.
+pub fn reset(db_path: &Path) -> Result<()> {
+    Store::open(db_path)?.reset_ingestion()
+}
+
 /// First-run path: record prior audit config, enable auditing, size the
 /// log, snapshot rules, and start the checkpoint cursor. Idempotent.
 pub fn enable_collection(db_path: &Path, progress: &dyn Fn(&str)) -> Result<()> {
@@ -243,12 +249,15 @@ pub fn analyze(db_path: &Path, progress: &dyn Fn(&str)) -> Result<AnalysisResult
     let mut note = String::new();
 
     if store.checkpoint_record_id()?.is_none() {
-        // auditing was already on (GPO or manual) before this tool first
-        // ran: adopt whatever history the log still holds
-        store.set_meta(
-            "collection_started",
-            &event_query::first_event_time()?.unwrap_or_else(now_iso),
-        )?;
+        // no checkpoint (first run, or an auto-reset after a model change):
+        // adopt whatever history the log still holds, but don't clobber an
+        // existing collection-start time
+        if store.get_meta("collection_started")?.is_none() {
+            store.set_meta(
+                "collection_started",
+                &event_query::first_event_time()?.unwrap_or_else(now_iso),
+            )?;
+        }
     }
 
     let checkpoint = store.checkpoint_record_id()?;

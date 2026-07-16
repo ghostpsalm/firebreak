@@ -8,6 +8,10 @@ pub struct Store {
     conn: Connection,
 }
 
+/// Bump when the attribution model changes so existing DBs auto-reset on
+/// next open. v2 = scope-based attribution (direction+protocol+ports+program).
+const MODEL_VERSION: &str = "2";
+
 /// Default DB location: %ProgramData%\firebreak\firebreak.db (survives per-user
 /// profile churn; tool runs elevated anyway).
 pub fn default_db_path() -> PathBuf {
@@ -82,7 +86,31 @@ impl Store {
             );
             "#,
         )?;
-        Ok(Store { conn })
+        let store = Store { conn };
+        // Self-healing: when the attribution model changes, aggregated usage
+        // from the old model is meaningless and the checkpoint has advanced
+        // past the events. Auto-wipe usage + checkpoint so the next run
+        // re-ingests the whole log under the new model — no manual DB delete.
+        let current = store.get_meta("model_version")?;
+        if current.as_deref() != Some(MODEL_VERSION) {
+            store.reset_ingestion()?;
+            store.set_meta("model_version", MODEL_VERSION)?;
+        }
+        Ok(store)
+    }
+
+    /// Clear all aggregated usage and the ingestion checkpoint so the next
+    /// analyze() re-reads the entire Security log. Keeps audit-enable state
+    /// (prior_audit_*, collection_started) and rule snapshots.
+    pub fn reset_ingestion(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "DELETE FROM rule_usage;
+             DELETE FROM rule_apps;
+             DELETE FROM rule_peers;
+             DELETE FROM meta WHERE key = 'checkpoint_record_id';
+             DELETE FROM meta WHERE key LIKE 'bucketlabel:%';",
+        )?;
+        Ok(())
     }
 
     // ---- transactions ----
