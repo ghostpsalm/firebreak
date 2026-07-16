@@ -9,8 +9,9 @@ pub struct Store {
 }
 
 /// Bump when the attribution model changes so existing DBs auto-reset on
-/// next open. v2 = scope-based attribution (direction+protocol+ports+program).
-const MODEL_VERSION: &str = "2";
+/// next open. v3 = scope attribution with unconstrained-rule exclusion and
+/// per-profile counts.
+const MODEL_VERSION: &str = "3";
 
 /// Default DB location: %ProgramData%\firebreak\firebreak.db (survives per-user
 /// profile churn; tool runs elevated anyway).
@@ -63,6 +64,15 @@ impl Store {
                 PRIMARY KEY (rule_id, peer)
             );
 
+            -- per-profile allow/block split (Domain/Private/Public/Unknown)
+            CREATE TABLE IF NOT EXISTS rule_profile_usage (
+                rule_id     TEXT NOT NULL,
+                profile     TEXT NOT NULL,
+                allow_count INTEGER NOT NULL DEFAULT 0,
+                block_count INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (rule_id, profile)
+            );
+
             -- WFP filter-id -> rule mapping, persisted per run and keyed by
             -- boot session (boot start time, ISO). Filter run-time IDs are
             -- only meaningful within one boot: the same numeric ID can name
@@ -107,6 +117,7 @@ impl Store {
             "DELETE FROM rule_usage;
              DELETE FROM rule_apps;
              DELETE FROM rule_peers;
+             DELETE FROM rule_profile_usage;
              DELETE FROM meta WHERE key = 'checkpoint_record_id';
              DELETE FROM meta WHERE key LIKE 'bucketlabel:%';",
         )?;
@@ -174,10 +185,17 @@ impl Store {
 
     // ---- ingestion ----
 
-    /// Record one event against a resolved rule id (or unmatched pseudo-id).
-    /// Hot path — statements are cached, and the caller wraps the whole
-    /// ingestion in one transaction via begin()/commit().
-    pub fn record_event(&self, rule_id: &str, ev: &EventRecord, app_normalized: &str) -> Result<()> {
+    /// Record one event against a resolved rule id (or default bucket).
+    /// `profile` is the network profile the connection used. Hot path —
+    /// statements are cached, and the caller wraps the whole ingestion in
+    /// one transaction via begin()/commit().
+    pub fn record_event(
+        &self,
+        rule_id: &str,
+        ev: &EventRecord,
+        app_normalized: &str,
+        profile: &str,
+    ) -> Result<()> {
         let (allow, block) = if ev.is_allow() { (1, 0) } else { (0, 1) };
         let mut stmt = self.conn.prepare_cached(
             "INSERT INTO rule_usage (rule_id, allow_count, block_count, first_seen, last_seen)
@@ -189,6 +207,14 @@ impl Store {
                 last_seen   = MAX(last_seen, ?4)",
         )?;
         stmt.execute(params![rule_id, allow, block, ev.time_created])?;
+        let mut stmt = self.conn.prepare_cached(
+            "INSERT INTO rule_profile_usage (rule_id, profile, allow_count, block_count)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(rule_id, profile) DO UPDATE SET
+                allow_count = allow_count + ?3,
+                block_count = block_count + ?4",
+        )?;
+        stmt.execute(params![rule_id, profile, allow, block])?;
         let mut stmt = self.conn.prepare_cached(
             "INSERT INTO rule_apps (rule_id, app_path, hits, last_seen)
              VALUES (?1, ?2, 1, ?3)
@@ -249,11 +275,30 @@ impl Store {
                 last_seen: row.get(4)?,
                 apps: Vec::new(),
                 distinct_peers: 0,
+                by_profile: Vec::new(),
             })
         })?;
         for u in rows {
             let u = u?;
             map.insert(u.rule_id.clone(), u);
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT rule_id, profile, allow_count, block_count FROM rule_profile_usage
+             ORDER BY rule_id, profile",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+        for r in rows {
+            let (rule_id, profile, allow, block) = r?;
+            if let Some(u) = map.get_mut(&rule_id) {
+                u.by_profile.push((profile, allow, block));
+            }
         }
         let mut stmt = self.conn.prepare(
             "SELECT rule_id, app_path, hits FROM rule_apps ORDER BY rule_id, hits DESC",
@@ -302,6 +347,7 @@ impl Store {
                 last_seen: row.get(3)?,
                 apps: Vec::new(),
                 distinct_peers: 0,
+                by_profile: Vec::new(),
             },
             None => return Ok(None),
         };
@@ -394,6 +440,7 @@ mod tests {
             dest_port: "443".into(),
             source_address: "10.0.0.1".into(),
             source_port: "50000".into(),
+            interface_index: 0,
         }
     }
 
@@ -401,13 +448,13 @@ mod tests {
     fn events_aggregate_counts_apps_and_seen_range() {
         let t = TempStore::new("agg");
         t.store
-            .record_event("r1", &ev(1, 5156, "2026-07-02T00:00:00.000Z", 7), r"C:\a.exe")
+            .record_event("r1", &ev(1, 5156, "2026-07-02T00:00:00.000Z", 7), r"C:\a.exe", "Public")
             .unwrap();
         t.store
-            .record_event("r1", &ev(2, 5157, "2026-07-03T00:00:00.000Z", 7), r"C:\b.exe")
+            .record_event("r1", &ev(2, 5157, "2026-07-03T00:00:00.000Z", 7), r"C:\b.exe", "Public")
             .unwrap();
         t.store
-            .record_event("r1", &ev(3, 5156, "2026-07-01T00:00:00.000Z", 7), r"C:\a.exe")
+            .record_event("r1", &ev(3, 5156, "2026-07-01T00:00:00.000Z", 7), r"C:\a.exe", "Public")
             .unwrap();
         let u = t.store.all_usage().unwrap().remove("r1").expect("usage");
         assert_eq!(u.allow_count, 2);
@@ -463,7 +510,7 @@ mod tests {
     fn unmatched_usage_filters_and_sorts() {
         let t = TempStore::new("unmatched");
         t.store
-            .record_event("default:Unknown", &ev(1, 5156, "2026-07-01T00:00:00Z", 5), "a")
+            .record_event("default:Unknown", &ev(1, 5156, "2026-07-01T00:00:00Z", 5), "a", "Public")
             .unwrap();
         for i in 0..3 {
             t.store
@@ -471,11 +518,12 @@ mod tests {
                     "default:Stealth",
                     &ev(2 + i, 5157, "2026-07-01T00:00:00Z", 6),
                     "b",
+                    "Public",
                 )
                 .unwrap();
         }
         t.store
-            .record_event("real-rule", &ev(9, 5156, "2026-07-01T00:00:00Z", 7), "c")
+            .record_event("real-rule", &ev(9, 5156, "2026-07-01T00:00:00Z", 7), "c", "Public")
             .unwrap();
         let unmatched = t.store.unmatched_usage().unwrap();
         assert_eq!(unmatched.len(), 2);

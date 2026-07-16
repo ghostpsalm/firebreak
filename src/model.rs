@@ -104,6 +104,9 @@ pub struct EventRecord {
     pub dest_port: String,
     pub source_address: String,
     pub source_port: String,
+    /// interface the connection used; maps to a network profile
+    /// (Domain/Private/Public) for profile-aware attribution
+    pub interface_index: u32,
 }
 
 impl EventRecord {
@@ -145,6 +148,8 @@ pub struct RuleUsage {
     /// distinct remote peer addresses observed (source for inbound,
     /// destination for outbound)
     pub distinct_peers: i64,
+    /// per-profile split: (profile, allow, block)
+    pub by_profile: Vec<(String, i64, i64)>,
 }
 
 /// A static baseline advisory attached to a rule by pattern matching.

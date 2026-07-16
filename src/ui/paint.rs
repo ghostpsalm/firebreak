@@ -735,7 +735,7 @@ fn row(app: &mut App, ui: &mut egui::Ui, ri: usize, rect: Rect, cols: &Cols, res
         ui.painter().text(Pos2::new(cols.hits.0 + 6.0, rect.center().y), Align2::LEFT_CENTER, hits_ab(r).0, t::mono(11.5), t::DISABLED);
         ui.painter().text(Pos2::new(cols.last.0, rect.center().y), Align2::LEFT_CENTER, &txt, if matches!(st, RowApply::Active(_)) { t::mono_medium(11.0) } else { t::sans(11.0) }, col);
     } else {
-        // hits A / B
+        // hits A / B (with per-profile split on hover)
         let (a, b, azero, bnz) = hits_ab_parts(r);
         let hx = cols.hits.0 + 6.0;
         let ga = ui.painter().layout_no_wrap(a.clone(), t::mono(11.5), if azero { t::DISABLED } else { t::INK });
@@ -743,6 +743,19 @@ fn row(app: &mut App, ui: &mut egui::Ui, ri: usize, rect: Rect, cols: &Cols, res
         ui.painter().galley(Pos2::new(hx, rect.center().y - ga.size().y / 2.0), ga, if azero { t::DISABLED } else { t::INK });
         ui.painter().text(Pos2::new(hx + wa + 4.0, rect.center().y), Align2::LEFT_CENTER, "/", t::mono(11.5), t::HAIRLINE_TEXT);
         ui.painter().text(Pos2::new(hx + wa + 12.0, rect.center().y), Align2::LEFT_CENTER, &b, t::mono(11.5), if bnz { t::BLOCK } else { t::DISABLED });
+        if let Some(u) = &r.usage {
+            if !u.by_profile.is_empty() {
+                let hits_rect = col_rect(cols.hits, rect);
+                if ui.rect_contains_pointer(hits_rect) {
+                    egui::show_tooltip_at_pointer(ui.ctx(), ui.layer_id(), egui::Id::new(("hits_tt", ri)), |ui| {
+                        ui.label(egui::RichText::new("Hits by profile (allow / block)").font(t::semibold(11.0)).color(t::INK));
+                        for (prof, al, bl) in &u.by_profile {
+                            ui.label(egui::RichText::new(format!("{prof}:  {} / {}", t::fmt_thousands(*al), t::fmt_thousands(*bl))).font(t::mono(11.0)).color(t::SECONDARY));
+                        }
+                    });
+                }
+            }
+        }
 
         // last seen
         let (last_txt, last_col) = match r.usage.as_ref().and_then(|u| u.last_seen.as_deref()) {
@@ -978,6 +991,26 @@ fn detail_panel(app: &mut App, ctx: &egui::Context) {
                 if let Some(u) = &r.usage {
                     let total = u.allow_count + u.block_count;
                     pad_label(ui, egui::RichText::new(format!("Evidence — {} connections", t::fmt_thousands(total))).font(t::semibold(11.5)).color(t::INK));
+                    // per-profile split
+                    if !u.by_profile.is_empty() {
+                        ui.add_space(6.0);
+                        for (prof, al, bl) in &u.by_profile {
+                            let color = match prof.as_str() {
+                                "Domain" => t::CHIP_DOM.1,
+                                "Private" => t::CHIP_PRV.1,
+                                "Public" => t::CHIP_PUB.1,
+                                _ => t::TERTIARY,
+                            };
+                            ui.horizontal(|ui| {
+                                ui.add_space(14.0);
+                                ui.label(egui::RichText::new(prof).font(t::semibold(11.0)).color(color));
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    ui.add_space(14.0);
+                                    ui.label(egui::RichText::new(format!("{} / {}", t::fmt_thousands(*al), t::fmt_thousands(*bl))).font(t::mono(11.0)).color(t::SECONDARY));
+                                });
+                            });
+                        }
+                    }
                     ui.add_space(8.0);
                     for (path, hits) in u.apps.iter().take(8) {
                         ui.horizontal(|ui| {

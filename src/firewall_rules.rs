@@ -85,6 +85,44 @@ ConvertTo-Json -InputObject @($out) -Compress -Depth 3
     Ok(rules)
 }
 
+/// Map interface index -> network profile (Domain/Private/Public) from the
+/// live connection profiles. Used to give each event a profile so
+/// attribution can respect a rule's profile scope and split hits per
+/// profile. Reflects the *current* profile of each interface (Windows
+/// doesn't record the profile in the event), which is stable in practice.
+pub fn interface_profile_map() -> std::collections::HashMap<u32, crate::scope::Profile> {
+    use crate::scope::Profile;
+    #[derive(serde::Deserialize)]
+    struct P {
+        #[serde(rename = "Index")]
+        index: u32,
+        #[serde(rename = "Cat")]
+        cat: String,
+    }
+    let script = r#"
+$ErrorActionPreference = 'SilentlyContinue'
+$out = Get-NetConnectionProfile | ForEach-Object {
+    [pscustomobject]@{ Index = [int]$_.InterfaceIndex; Cat = [string]$_.NetworkCategory }
+}
+ConvertTo-Json -InputObject @($out) -Compress
+"#;
+    let mut map = std::collections::HashMap::new();
+    if let Ok(json) = run_powershell(script) {
+        if let Ok(list) = serde_json::from_str::<Vec<P>>(json.trim()) {
+            for p in list {
+                let prof = match p.cat.as_str() {
+                    "DomainAuthenticated" => Profile::Domain,
+                    "Private" => Profile::Private,
+                    "Public" => Profile::Public,
+                    _ => Profile::Unknown,
+                };
+                map.insert(p.index, prof);
+            }
+        }
+    }
+    map
+}
+
 /// Cached rule set (JSON) for instant startup; refreshed each run. Lives
 /// alongside the DB under the ACL-protected data dir.
 fn rules_cache_path() -> PathBuf {

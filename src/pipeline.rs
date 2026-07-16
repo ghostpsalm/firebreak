@@ -291,6 +291,7 @@ pub fn analyze(db_path: &Path, progress: &dyn Fn(&str)) -> Result<AnalysisResult
     // exercised". FilterOrigin is used only to label events that match no
     // rule scope (pure default/system traffic) in the Unattributed panel.
     let scope_index = crate::scope::ScopeIndex::build(&rules);
+    let iface_profiles = firewall_rules::interface_profile_map();
 
     // everything from here to the checkpoint advance is one transaction:
     // a crash rolls back cleanly and a rerun re-ingests without double-count
@@ -312,7 +313,8 @@ pub fn analyze(db_path: &Path, progress: &dyn Fn(&str)) -> Result<AnalysisResult
             max_record_id = Some(ev.record_id);
         }
         let app = app_identity::normalize_path(&ev.application, &device_map);
-        let conn = crate::scope::Conn::from_event(&ev, &app);
+        let conn = crate::scope::Conn::from_event(&ev, &app, &iface_profiles);
+        let profile = conn.profile.label();
         let matched = scope_index.matching_rules(&conn);
         if matched.is_empty() {
             // no rule's scope covers this connection — a default/system
@@ -322,13 +324,13 @@ pub fn analyze(db_path: &Path, progress: &dyn Fn(&str)) -> Result<AnalysisResult
             let origin = if origin.is_empty() { "Unknown" } else { origin };
             let bucket = format!("default:{origin}");
             bucket_labels.entry(bucket.clone()).or_insert_with(|| origin.to_string());
-            if store.record_event(&bucket, &ev, &app).is_err() {
+            if store.record_event(&bucket, &ev, &app, profile).is_err() {
                 errors += 1;
             }
         } else {
             // credit every rule whose scope this connection matches
             for rule_name in matched {
-                if store.record_event(rule_name, &ev, &app).is_err() {
+                if store.record_event(rule_name, &ev, &app, profile).is_err() {
                     errors += 1;
                 }
             }

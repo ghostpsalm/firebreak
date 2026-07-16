@@ -280,6 +280,7 @@ pub fn parse_event_xml(xml: &str) -> Option<EventRecord> {
     let mut dest_port = String::new();
     let mut source_address = String::new();
     let mut source_port = String::new();
+    let mut interface_index: u32 = 0;
 
     let mut buf = Vec::new();
     loop {
@@ -332,6 +333,7 @@ pub fn parse_event_xml(xml: &str) -> Option<EventRecord> {
                         "DestPort" => dest_port = text,
                         "SourceAddress" => source_address = text,
                         "SourcePort" => source_port = text,
+                        "InterfaceIndex" => interface_index = text.parse().unwrap_or(0),
                         _ => {}
                     }
                 }
@@ -370,6 +372,7 @@ pub fn parse_event_xml(xml: &str) -> Option<EventRecord> {
         dest_port,
         source_address,
         source_port,
+        interface_index,
     })
 }
 

@@ -58,6 +58,7 @@ fn usage(id: &str, allow: i64, block: i64, last_min_ago: i64, apps: &[(&str, i64
         last_seen: Some(iso_ago(last_min_ago)),
         apps: apps.iter().map(|(p, h)| (p.to_string(), *h)).collect(),
         distinct_peers: 3,
+        by_profile: vec![("Domain".into(), allow / 2, block), ("Private".into(), allow - allow / 2, 0)],
     }
 }
 
@@ -221,6 +222,7 @@ fn unmatched_row(fid: &str, name: &str, allow: i64, block: i64) -> UnmatchedRow 
             last_seen: Some(iso_ago(120)),
             apps: vec![("System".into(), block.max(allow))],
             distinct_peers: 12,
+            by_profile: Vec::new(),
         },
     }
 }
