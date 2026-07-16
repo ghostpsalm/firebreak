@@ -151,6 +151,25 @@ pub(crate) enum DirFilter {
     All,
 }
 
+/// User-adjustable widths for the fixed table columns (Rule and Apps stay
+/// flexible). Dragging a header divider updates these.
+#[derive(Clone, Copy)]
+pub(crate) struct ColWidths {
+    pub dir: f32,
+    pub action: f32,
+    pub profiles: f32,
+    pub scope: f32,
+    pub hits: f32,
+    pub last: f32,
+    pub listen: f32,
+}
+
+impl Default for ColWidths {
+    fn default() -> Self {
+        ColWidths { dir: 44.0, action: 54.0, profiles: 118.0, scope: 150.0, hits: 100.0, last: 78.0, listen: 132.0 }
+    }
+}
+
 struct ApplyState {
     rx: Receiver<ApplyMsg>,
     total: usize,
@@ -185,6 +204,7 @@ pub struct App {
     show_public: bool,
     sort: Sort,
     sort_asc: bool,
+    col_w: ColWidths,
 
     selected: Option<usize>,
     drawer_open: bool,
@@ -225,6 +245,7 @@ impl App {
             show_public: true,
             sort: Sort::Hits,
             sort_asc: false, // hits descending by default (design)
+            col_w: ColWidths::default(),
             selected: None,
             drawer_open: false,
             tab: Tab::Sockets,

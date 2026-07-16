@@ -172,9 +172,12 @@ fn titlebar(app: &mut App, ctx: &egui::Context) {
             super::stroke_bottom(p, rect, t::BORDER);
             let logo_rect = Rect::from_min_size(Pos2::new(rect.left() + 10.0, rect.center().y - 9.0), Vec2::splat(18.0));
             p.image(logo.id(), logo_rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
-            p.text(Pos2::new(logo_rect.right() + 8.0, rect.center().y), Align2::LEFT_CENTER, "firebreak", t::semibold(12.0), t::INK);
+            let name_pos = Pos2::new(logo_rect.right() + 8.0, rect.center().y);
+            let name_galley = p.layout_no_wrap("firebreak".to_string(), t::semibold(12.0), t::INK);
+            p.galley(Pos2::new(name_pos.x, name_pos.y - name_galley.size().y / 2.0), name_galley.clone(), t::INK);
             let host = if app.ctx_info.hostname.is_empty() { String::new() } else { format!(" · {}", app.ctx_info.hostname) };
-            p.text(Pos2::new(logo_rect.right() + 76.0, rect.center().y), Align2::LEFT_CENTER, format!("— Windows Firewall usage audit{host}"), t::sans(11.0), t::FAINT);
+            // catchline sits just after the name (small fixed gap), not floated far right
+            p.text(Pos2::new(name_pos.x + name_galley.size().x + 12.0, rect.center().y), Align2::LEFT_CENTER, format!("— Windows Firewall Audit{host}"), t::sans(11.0), t::FAINT);
 
             // min / max / close — each a 46px hit target
             let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
@@ -239,9 +242,9 @@ fn header(app: &mut App, ctx: &egui::Context) {
                         .as_deref()
                         .map(time_util::since_with_age)
                         .unwrap_or_else(|| "just now".into());
-                    stat(ui, "Auditing active", &format!("since {since}"));
+                    stat(ui, "Auditing active", &format!("Since {since}"));
                 } else {
-                    stat(ui, "Auditing is off", "no connection data has ever been collected");
+                    stat(ui, "Auditing is off", "No connection data has ever been collected");
                 }
 
                 if active {
@@ -250,10 +253,10 @@ fn header(app: &mut App, ctx: &egui::Context) {
                         .ctx_info
                         .last_ingest
                         .as_deref()
-                        .map(|s| format!("this run · last ingest {}", time_util::relative(s)))
-                        .unwrap_or_else(|| "this run".into());
+                        .map(|s| format!("This run · Last Ingest {}", time_util::relative(s)))
+                        .unwrap_or_else(|| "This run".into());
                     let events = if app.phase == Phase::Loading || app.phase == Phase::Enabling {
-                        format!("ingesting… {}", app.progress)
+                        format!("Ingesting… {}", app.progress)
                     } else {
                         format!("{} events", t::fmt_thousands(app.ctx_info.events_processed as i64))
                     };
@@ -264,16 +267,17 @@ fn header(app: &mut App, ctx: &egui::Context) {
                     stat(
                         ui,
                         if gap { "Coverage gap" } else { "Coverage complete" },
-                        if gap { "see warning below" } else { "no gaps detected in audit log" },
+                        if gap { "See Warning below" } else { "No gaps detected in Audit Log" },
                     );
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let settings = settings_button(ui);
-                    if settings.clicked() {
+                    let just_toggled = settings.clicked();
+                    if just_toggled {
                         app.settings_open = !app.settings_open;
                     }
-                    settings_menu(app, ui, ctx, settings.rect);
+                    settings_menu(app, ui, ctx, settings.rect, just_toggled);
                     if active {
                         ui.add_space(8.0);
                         if flat_button(ui, "Refresh now").clicked() {
@@ -342,7 +346,7 @@ fn link(ui: &mut egui::Ui, label: &str, color: Color32) -> egui::Response {
 }
 
 /// Dropdown anchored under the Settings button.
-fn settings_menu(app: &mut App, _ui: &mut egui::Ui, ctx: &egui::Context, anchor: Rect) {
+fn settings_menu(app: &mut App, _ui: &mut egui::Ui, ctx: &egui::Context, anchor: Rect, just_toggled: bool) {
     if !app.settings_open {
         return;
     }
@@ -402,8 +406,9 @@ fn settings_menu(app: &mut App, _ui: &mut egui::Ui, ctx: &egui::Context, anchor:
                 }
             });
     });
-    // click-away closes
-    if resp.response.clicked_elsewhere() {
+    // click-away closes — but not on the very frame the Settings button was
+    // clicked to open it (that click reads as "elsewhere" to the menu area)
+    if !just_toggled && resp.response.clicked_elsewhere() {
         app.settings_open = false;
     }
 }
@@ -752,8 +757,8 @@ struct Cols {
 }
 
 impl Cols {
-    fn compute(left: f32, width: f32) -> Cols {
-        let fixed = 34.0 + 44.0 + 54.0 + 118.0 + 150.0 + 100.0 + 78.0 + 132.0;
+    fn compute(left: f32, width: f32, cw: &super::ColWidths) -> Cols {
+        let fixed = 34.0 + cw.dir + cw.action + cw.profiles + cw.scope + cw.hits + cw.last + cw.listen;
         let flex = (width - fixed).max(300.0);
         let name_w = (flex * (1.35 / 2.35)).max(190.0);
         let apps_w = (flex - name_w).max(100.0);
@@ -766,17 +771,21 @@ impl Cols {
         Cols {
             check: col(34.0).0,
             name: col(name_w),
-            dir: col(44.0),
-            action: col(54.0),
-            profiles: col(118.0),
-            scope: col(150.0),
-            hits: col(100.0),
-            last: col(78.0),
+            dir: col(cw.dir),
+            action: col(cw.action),
+            profiles: col(cw.profiles),
+            scope: col(cw.scope),
+            hits: col(cw.hits),
+            last: col(cw.last),
             apps: col(apps_w),
-            listen: col(132.0),
+            listen: col(cw.listen),
         }
     }
 }
+
+/// Text indent inside a column cell so content isn't flush against the
+/// separator on its left.
+const CELL_PAD: f32 = 8.0;
 
 fn central(app: &mut App, ctx: &egui::Context) {
     egui::CentralPanel::default()
@@ -789,7 +798,8 @@ fn central(app: &mut App, ctx: &egui::Context) {
                 return;
             }
             let full = ui.max_rect();
-            let cols = Cols::compute(full.left(), full.width());
+            let cw = app.col_w;
+            let cols = Cols::compute(full.left(), full.width(), &cw);
             let visible = app.visible();
             if visible.is_empty() {
                 table_header(ui, app, &cols);
@@ -810,7 +820,7 @@ fn central(app: &mut App, ctx: &egui::Context) {
                     for vi in range {
                         let ri = visible[vi];
                         let (rect, resp) = ui.allocate_exact_size(Vec2::new(cols.listen.0 + cols.listen.1 - full.left(), ROW_H), Sense::click());
-                        let rc = Cols::compute(rect.left(), rect.width());
+                        let rc = Cols::compute(rect.left(), rect.width(), &cw);
                         row(app, ui, ri, rect, &rc, resp);
                     }
                 },
@@ -821,6 +831,34 @@ fn central(app: &mut App, ctx: &egui::Context) {
         });
 }
 
+/// Column boundaries that carry a draggable resize handle, paired with a
+/// mutable-width selector into ColWidths. The right edge of each fixed
+/// column is a handle that grows/shrinks that column.
+fn resize_handles(app: &mut App, ui: &mut egui::Ui, cols: &Cols, header_rect: Rect) {
+    // (right_edge_x, which width to adjust)
+    let edges: [(f32, fn(&mut super::ColWidths) -> &mut f32); 7] = [
+        (cols.dir.0 + cols.dir.1, |c| &mut c.dir),
+        (cols.action.0 + cols.action.1, |c| &mut c.action),
+        (cols.profiles.0 + cols.profiles.1, |c| &mut c.profiles),
+        (cols.scope.0 + cols.scope.1, |c| &mut c.scope),
+        (cols.hits.0 + cols.hits.1, |c| &mut c.hits),
+        (cols.last.0 + cols.last.1, |c| &mut c.last),
+        (cols.listen.0 + cols.listen.1, |c| &mut c.listen),
+    ];
+    for (i, (x, sel)) in edges.into_iter().enumerate() {
+        let hit = Rect::from_min_max(Pos2::new(x - 3.0, header_rect.top()), Pos2::new(x + 3.0, header_rect.bottom()));
+        let resp = ui.interact(hit, ui.id().with(("colresize", i)), Sense::drag());
+        if resp.hovered() || resp.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+            ui.painter().vline(x, header_rect.y_range(), Stroke::new(1.0, t::ACCENT));
+        }
+        if resp.dragged() {
+            let w = sel(&mut app.col_w);
+            *w = (*w + resp.drag_delta().x).clamp(30.0, 400.0);
+        }
+    }
+}
+
 use super::ROW_H;
 use super::HEADER_H;
 
@@ -829,23 +867,22 @@ fn table_header(ui: &mut egui::Ui, app: &mut App, cols: &Cols) {
     let rect = Rect::from_min_size(full.min, Vec2::new(full.width(), HEADER_H));
     let p = ui.painter();
     p.rect_filled(rect, 0.0, t::RAISED);
-    p.hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, t::CONTROL_BORDER));
     let font = t::semibold(11.0);
     let c = t::SECONDARY;
     let y = rect.center().y;
     let th = |x: f32, s: &str, col: Color32| {
-        ui.painter().text(Pos2::new(x, y), Align2::LEFT_CENTER, s, font.clone(), col);
+        ui.painter().text(Pos2::new(x + CELL_PAD, y), Align2::LEFT_CENTER, s, font.clone(), col);
     };
     let young = app.young_evidence_hours().is_some();
     let usage_hidden = app.phase == Phase::NeedsEnable;
-    th(cols.name.0 + 10.0, "Rule", c);
+    th(cols.name.0, "Rule", c);
     th(cols.dir.0, "Dir", c);
     th(cols.action.0, "Action", c);
     th(cols.profiles.0, "Profiles", c);
     th(cols.scope.0, "Scope", c);
     if usage_hidden {
         ui.painter().text(
-            Pos2::new(cols.hits.0, y),
+            Pos2::new(cols.hits.0 + CELL_PAD, y),
             Align2::LEFT_CENTER,
             "Hits · Last seen · Apps",
             font.clone(),
@@ -859,18 +896,20 @@ fn table_header(ui: &mut egui::Ui, app: &mut App, cols: &Cols) {
             t::CB_EMPTY_BORDER,
         );
     } else {
-        // hits header: clickable sort + young-evidence tint
+        // hits header: clickable sort + young-evidence tint (leave 1px at the
+        // bottom so the header's bottom border still shows through the fill)
         let hits_rect = Rect::from_min_size(Pos2::new(cols.hits.0, rect.top()), Vec2::new(cols.hits.1, HEADER_H));
         let last_rect = Rect::from_min_size(Pos2::new(cols.last.0, rect.top()), Vec2::new(cols.last.1, HEADER_H));
         if young {
-            ui.painter().rect_filled(hits_rect, 0.0, t::ADVISORY_BG);
-            ui.painter().rect_filled(last_rect, 0.0, t::ADVISORY_BG);
+            let inset = |r: Rect| Rect::from_min_max(r.min, Pos2::new(r.right(), r.bottom() - 1.0));
+            ui.painter().rect_filled(inset(hits_rect), 0.0, t::ADVISORY_BG);
+            ui.painter().rect_filled(inset(last_rect), 0.0, t::ADVISORY_BG);
         }
         let hits_col = if young { t::ADVISORY_HEADER } else { t::INK };
-        th(cols.hits.0 + 6.0, "Hits A / B", hits_col);
+        th(cols.hits.0, "Hits A / B", hits_col);
         // sort/young indicator triangle after the label
         let hg = ui.painter().layout_no_wrap("Hits A / B".into(), font.clone(), hits_col);
-        let ax = cols.hits.0 + 6.0 + hg.size().x + 7.0;
+        let ax = cols.hits.0 + CELL_PAD + hg.size().x + 7.0;
         if young {
             glyph::warn_tri(ui.painter(), Pos2::new(ax, y), 8.0, t::ADVISORY);
         } else if app.sort == Sort::Hits {
@@ -882,7 +921,7 @@ fn table_header(ui: &mut egui::Ui, app: &mut App, cols: &Cols) {
         }
         th(cols.last.0, "Last seen", if young { t::ADVISORY_HEADER } else { c });
         th(cols.apps.0, "Apps observed", c);
-        th(cols.listen.0 + 10.0, "Listening now", c);
+        th(cols.listen.0, "Listening now", c);
         // sort interactions
         if ui.interact(hits_rect, ui.id().with("sort_hits"), Sense::click()).clicked() {
             toggle_sort(app, Sort::Hits);
@@ -895,6 +934,14 @@ fn table_header(ui: &mut egui::Ui, app: &mut App, cols: &Cols) {
     if ui.interact(name_rect, ui.id().with("sort_name"), Sense::click()).clicked() {
         toggle_sort(app, Sort::Name);
     }
+    // column separators
+    for x in [cols.name.0, cols.dir.0, cols.action.0, cols.profiles.0, cols.scope.0, cols.hits.0, cols.last.0, cols.apps.0, cols.listen.0] {
+        ui.painter().vline(x, rect.y_range(), Stroke::new(1.0, t::BORDER_LIGHT));
+    }
+    // resize handles on the fixed-column right edges
+    resize_handles(app, ui, cols, rect);
+    // bottom border last, full width and on top of the yellow fills
+    ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, t::CONTROL_BORDER));
 }
 
 fn toggle_sort(app: &mut App, key: Sort) {
@@ -944,6 +991,11 @@ fn row(app: &mut App, ui: &mut egui::Ui, ri: usize, rect: Rect, cols: &Cols, res
     let p = ui.painter();
     p.rect_filled(rect, 0.0, bg);
     p.hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, t::ROW_BORDER));
+    // faint column separators, aligned with the header's
+    let sep = Stroke::new(1.0, t::ROW_BORDER);
+    for x in [cols.name.0, cols.dir.0, cols.action.0, cols.profiles.0, cols.scope.0, cols.hits.0, cols.last.0, cols.apps.0, cols.listen.0] {
+        p.vline(x, rect.y_range(), sep);
+    }
     // edge bar
     if failed {
         p.rect_filled(Rect::from_min_size(rect.min, Vec2::new(3.0, rect.height())), 0.0, t::DESTRUCTIVE);
@@ -966,25 +1018,25 @@ fn row(app: &mut App, ui: &mut egui::Ui, ri: usize, rect: Rect, cols: &Cols, res
     // name (+ flag)
     let name_font = if pending && !dimmed { t::medium(12.0) } else { t::sans(12.0) };
     let flag_pad = if !r.flags.is_empty() { 16.0 } else { 0.0 };
-    let name_rect = Rect::from_min_size(Pos2::new(cols.name.0, rect.top()), Vec2::new(cols.name.1 - 10.0 - flag_pad, rect.height()));
-    cell_text(ui.painter(), name_rect, &r.rule.display_name, name_font, text_col, 10.0);
+    let name_rect = Rect::from_min_size(Pos2::new(cols.name.0, rect.top()), Vec2::new(cols.name.1 - CELL_PAD - flag_pad, rect.height()));
+    cell_text(ui.painter(), name_rect, &r.rule.display_name, name_font, text_col, CELL_PAD);
     if !r.flags.is_empty() {
         // width of name for flag placement
         let g = ui.painter().layout_no_wrap(r.rule.display_name.clone(), t::sans(12.0), t::ADVISORY);
-        let fx = (cols.name.0 + 10.0 + g.size().x + 10.0).min(cols.name.0 + cols.name.1 - 10.0);
+        let fx = (cols.name.0 + CELL_PAD + g.size().x + 8.0).min(cols.name.0 + cols.name.1 - 10.0);
         glyph::warn_tri(ui.painter(), Pos2::new(fx, rect.center().y), 9.0, t::ADVISORY);
     }
 
     // dir / action
-    cell_text(ui.painter(), col_rect(cols.dir, rect), dir_short(&r.rule.direction), t::sans(11.5), if dimmed { t::DISABLED } else { t::TERTIARY }, 0.0);
+    cell_text(ui.painter(), col_rect(cols.dir, rect), dir_short(&r.rule.direction), t::sans(11.5), if dimmed { t::DISABLED } else { t::TERTIARY }, CELL_PAD);
     let act_col = if dimmed { t::DISABLED } else if r.rule.action.eq_ignore_ascii_case("block") { t::BLOCK } else { t::INK };
-    cell_text(ui.painter(), col_rect(cols.action, rect), act_short(&r.rule.action), t::sans(12.0), act_col, 0.0);
+    cell_text(ui.painter(), col_rect(cols.action, rect), act_short(&r.rule.action), t::sans(12.0), act_col, CELL_PAD);
 
     // profiles chips — clickable to toggle a profile off/on for this rule
     let orig = r.orig_profiles();
     let target = r.target_profiles;
     let mut clicked_profile: Option<u8> = None;
-    let mut cx = cols.profiles.0;
+    let mut cx = cols.profiles.0 + CELL_PAD;
     let editable = app.apply.is_none() && app.phase == Phase::Ready;
     for (bit, present, kept, label) in [
         (0u8, orig.domain, target.domain, "Domain"),
@@ -1002,20 +1054,20 @@ fn row(app: &mut App, ui: &mut egui::Ui, ri: usize, rect: Rect, cols: &Cols, res
     }
 
     // scope (mono)
-    cell_text(ui.painter(), Rect::from_min_size(Pos2::new(cols.scope.0, rect.top()), Vec2::new(cols.scope.1 - 8.0, rect.height())), &listeners::scope_summary(&r.rule), t::mono(11.0), if dimmed { t::DISABLED } else { t::SECONDARY }, 0.0);
+    cell_text(ui.painter(), Rect::from_min_size(Pos2::new(cols.scope.0, rect.top()), Vec2::new(cols.scope.1 - CELL_PAD, rect.height())), &listeners::scope_summary(&r.rule), t::mono(11.0), if dimmed { t::DISABLED } else { t::SECONDARY }, CELL_PAD);
 
     // usage columns (hidden on first run)
     if app.phase == Phase::NeedsEnable {
-        ui.painter().text(Pos2::new(cols.hits.0, rect.center().y), Align2::LEFT_CENTER, "—  ·  —  ·  —", t::sans(11.0), t::FIRSTRUN_DASH);
+        ui.painter().text(Pos2::new(cols.hits.0 + CELL_PAD, rect.center().y), Align2::LEFT_CENTER, "—  ·  —  ·  —", t::sans(11.0), t::FIRSTRUN_DASH);
     } else if let Some(st) = &apply_status {
         // apply status occupies the last-seen/apps span
         let (txt, col) = st.label(r);
-        ui.painter().text(Pos2::new(cols.hits.0 + 6.0, rect.center().y), Align2::LEFT_CENTER, hits_ab(r).0, t::mono(11.5), t::DISABLED);
-        ui.painter().text(Pos2::new(cols.last.0, rect.center().y), Align2::LEFT_CENTER, &txt, if matches!(st, RowApply::Active(_)) { t::mono_medium(11.0) } else { t::sans(11.0) }, col);
+        ui.painter().text(Pos2::new(cols.hits.0 + CELL_PAD, rect.center().y), Align2::LEFT_CENTER, hits_ab(r).0, t::mono(11.5), t::DISABLED);
+        ui.painter().text(Pos2::new(cols.last.0 + CELL_PAD, rect.center().y), Align2::LEFT_CENTER, &txt, if matches!(st, RowApply::Active(_)) { t::mono_medium(11.0) } else { t::sans(11.0) }, col);
     } else {
         // hits A / B (with per-profile split on hover)
         let (a, b, azero, bnz) = hits_ab_parts(r);
-        let hx = cols.hits.0 + 6.0;
+        let hx = cols.hits.0 + CELL_PAD;
         let ga = ui.painter().layout_no_wrap(a.clone(), t::mono(11.5), if azero { t::DISABLED } else { t::INK });
         let wa = ga.size().x;
         ui.painter().galley(Pos2::new(hx, rect.center().y - ga.size().y / 2.0), ga, if azero { t::DISABLED } else { t::INK });
@@ -1040,18 +1092,18 @@ fn row(app: &mut App, ui: &mut egui::Ui, ri: usize, rect: Rect, cols: &Cols, res
             Some(ls) => (time_util::relative(ls), t::SECONDARY),
             None => ("never".to_string(), t::DISABLED),
         };
-        cell_text(ui.painter(), col_rect(cols.last, rect), &last_txt, t::sans(11.0), last_col, 0.0);
+        cell_text(ui.painter(), col_rect(cols.last, rect), &last_txt, t::sans(11.0), last_col, CELL_PAD);
 
         // apps observed
         let apps = apps_summary(r);
         let (apps_txt, apps_col) = if apps.is_empty() { ("—".to_string(), t::HAIRLINE_TEXT) } else { (apps, t::SECONDARY) };
-        cell_text(ui.painter(), Rect::from_min_size(Pos2::new(cols.apps.0, rect.top()), Vec2::new(cols.apps.1 - 8.0, rect.height())), &apps_txt, t::sans(11.0), apps_col, 0.0);
+        cell_text(ui.painter(), Rect::from_min_size(Pos2::new(cols.apps.0, rect.top()), Vec2::new(cols.apps.1 - CELL_PAD, rect.height())), &apps_txt, t::sans(11.0), apps_col, CELL_PAD);
 
         // listening chip
         if let Some(first) = r.listening.first() {
-            draw_listen_chip(ui.painter(), Pos2::new(cols.listen.0 + 10.0, rect.center().y - 8.5), first);
+            draw_listen_chip(ui.painter(), Pos2::new(cols.listen.0 + CELL_PAD, rect.center().y - 8.5), first);
         } else {
-            ui.painter().text(Pos2::new(cols.listen.0 + 10.0, rect.center().y), Align2::LEFT_CENTER, "—", t::sans(11.0), t::HAIRLINE_TEXT);
+            ui.painter().text(Pos2::new(cols.listen.0 + CELL_PAD, rect.center().y), Align2::LEFT_CENTER, "—", t::sans(11.0), t::HAIRLINE_TEXT);
         }
     }
 
