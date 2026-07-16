@@ -16,6 +16,12 @@ pub fn now_iso() -> String {
     Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
 }
 
+/// Full version: major.minor.patch.build (build = git commit count, set at
+/// compile time). e.g. "0.5.3.412".
+pub fn version_string() -> String {
+    format!("{}.{}", env!("CARGO_PKG_VERSION"), env!("FIREBREAK_BUILD"))
+}
+
 pub fn hostname() -> String {
     std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))

@@ -138,10 +138,24 @@ enum Tab {
 }
 
 #[derive(PartialEq, Clone, Copy)]
-enum Sort {
-    Hits,
+pub(crate) enum Sort {
+    Enabled,
     Name,
+    Dir,
+    Action,
+    Profiles,
+    Scope,
+    Hits,
     LastSeen,
+    Apps,
+    Listening,
+}
+
+impl Sort {
+    /// Text columns default to ascending (A→Z); counts/time to descending.
+    fn default_ascending(self) -> bool {
+        !matches!(self, Sort::Hits | Sort::LastSeen)
+    }
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -736,13 +750,20 @@ impl App {
         idx.sort_by(|&a, &b| {
             let (ra, rb) = (&self.rows[a], &self.rows[b]);
             let ord = match self.sort {
+                Sort::Enabled => ra.rule.is_enabled().cmp(&rb.rule.is_enabled()),
+                Sort::Name => ra.rule.display_name.to_lowercase().cmp(&rb.rule.display_name.to_lowercase()),
+                Sort::Dir => ra.rule.direction.cmp(&rb.rule.direction),
+                Sort::Action => ra.rule.action.cmp(&rb.rule.action),
+                Sort::Profiles => ra.rule.profile.cmp(&rb.rule.profile),
+                Sort::Scope => crate::listeners::scope_summary(&ra.rule).cmp(&crate::listeners::scope_summary(&rb.rule)),
                 Sort::Hits => ra.total_hits().cmp(&rb.total_hits()),
-                Sort::Name => ra.rule.display_name.cmp(&rb.rule.display_name),
                 Sort::LastSeen => {
                     let la = ra.usage.as_ref().and_then(|u| u.last_seen.clone());
                     let lb = rb.usage.as_ref().and_then(|u| u.last_seen.clone());
                     la.cmp(&lb)
                 }
+                Sort::Apps => ra.seen_apps.join(",").to_lowercase().cmp(&rb.seen_apps.join(",").to_lowercase()),
+                Sort::Listening => ra.listening.join(",").cmp(&rb.listening.join(",")),
             };
             if self.sort_asc { ord } else { ord.reverse() }
         });

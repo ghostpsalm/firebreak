@@ -427,7 +427,7 @@ fn settings_menu(app: &mut App, _ui: &mut egui::Ui, ctx: &egui::Context, anchor:
                 if menu_item(ui, "Check for updates…", true) {
                     app.status = format!(
                         "firebreak {} — no update channel configured; check your source for newer builds.",
-                        env!("CARGO_PKG_VERSION")
+                        crate::pipeline::version_string()
                     );
                     app.settings_open = false;
                 }
@@ -553,7 +553,7 @@ fn about_box(app: &mut App, ctx: &egui::Context) {
                 ui.add_space(8.0);
                 ui.vertical(|ui| {
                     ui.label(egui::RichText::new("firebreak").font(t::semibold(15.0)).color(t::INK));
-                    ui.label(egui::RichText::new(format!("Version {}", env!("CARGO_PKG_VERSION"))).font(t::mono(11.0)).color(t::SECONDARY));
+                    ui.label(egui::RichText::new(format!("Version {}", crate::pipeline::version_string())).font(t::mono(11.0)).color(t::SECONDARY));
                 });
             });
             ui.add_space(12.0);
@@ -729,24 +729,24 @@ fn filter_bar(app: &mut App, ctx: &egui::Context) {
                 let dir = app.dir_filter;
                 let mut new_dir = dir;
                 segmented_choice(ui, &[
-                    ("In", DirFilter::In),
-                    ("Out", DirFilter::Out),
-                    ("All", DirFilter::All),
+                    ("In", DirFilter::In, "Show only inbound rules (traffic arriving at this PC)"),
+                    ("Out", DirFilter::Out, "Show only outbound rules (traffic this PC initiates)"),
+                    ("All", DirFilter::All, "Show both inbound and outbound rules"),
                 ], dir, &mut new_dir);
                 app.dir_filter = new_dir;
 
                 ui.add_space(4.0);
                 let zero_enabled = app.ctx_info.auditing_active;
                 segmented_toggles(ui, &mut [
-                    ("Enabled only", &mut app.only_enabled, true),
-                    ("Zero-hit", &mut app.only_zero_hit, zero_enabled),
-                    ("Flagged", &mut app.only_flagged, true),
+                    ("Enabled only", &mut app.only_enabled, true, "Show only rules that are currently enabled (hide disabled ones)"),
+                    ("Zero-hit", &mut app.only_zero_hit, zero_enabled, "Show only rules with no observed traffic — the disable candidates"),
+                    ("Flagged", &mut app.only_flagged, true, "Show only rules with a security advisory (e.g. RDP, SMB-inbound, broad allow, mDNS)"),
                 ]);
                 ui.add_space(4.0);
                 segmented_toggles(ui, &mut [
-                    ("Domain", &mut app.show_domain, true),
-                    ("Private", &mut app.show_private, true),
-                    ("Public", &mut app.show_public, true),
+                    ("Domain", &mut app.show_domain, true, "Include rules active on the Domain profile (corporate/AD network)"),
+                    ("Private", &mut app.show_private, true, "Include rules active on the Private profile (home/trusted network)"),
+                    ("Public", &mut app.show_public, true, "Include rules active on the Public profile (untrusted/public network)"),
                 ]);
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -766,12 +766,12 @@ fn filter_bar(app: &mut App, ctx: &egui::Context) {
 /// One segment cell of a segmented control; returns its click response.
 /// `first` controls the left border; height is fixed to CTRL_H so groups
 /// align regardless of label width.
-fn segment_cell(ui: &mut egui::Ui, label: &str, active: bool, enabled: bool, first: bool) -> egui::Response {
+fn segment_cell(ui: &mut egui::Ui, label: &str, active: bool, enabled: bool, first: bool, tooltip: &str) -> egui::Response {
     let text_col = if active { Color32::WHITE } else if enabled { t::SECONDARY } else { t::CB_EMPTY_BORDER };
     let galley = ui.painter().layout_no_wrap(label.to_string(), t::sans(11.5), text_col);
     let w = galley.size().x + 20.0;
-    let sense = if enabled { Sense::click() } else { Sense::hover() };
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, CTRL_H), sense);
+    // sense hover even when disabled so the tooltip still shows
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, CTRL_H), Sense::click());
     let fill = if active { t::DARK_SEGMENT } else if resp.hovered() && enabled { t::HOVER_WASH } else { Color32::WHITE };
     ui.painter().rect_filled(rect, 0.0, fill);
     let border = Stroke::new(1.0, t::CONTROL_BORDER);
@@ -782,15 +782,21 @@ fn segment_cell(ui: &mut egui::Ui, label: &str, active: bool, enabled: bool, fir
         ui.painter().vline(rect.left() + 0.5, rect.y_range(), border);
     }
     ui.painter().galley(rect.center() - galley.size() / 2.0, galley, text_col);
+    if resp.hovered() && enabled {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    if !tooltip.is_empty() {
+        resp.clone().on_hover_text(tooltip);
+    }
     resp
 }
 
 /// Segmented multi-toggle (each cell independently on/off).
-fn segmented_toggles(ui: &mut egui::Ui, segs: &mut [(&str, &mut bool, bool)]) {
+fn segmented_toggles(ui: &mut egui::Ui, segs: &mut [(&str, &mut bool, bool, &str)]) {
     let prev = ui.spacing().item_spacing;
     ui.spacing_mut().item_spacing.x = 0.0;
-    for (i, (label, state, enabled)) in segs.iter_mut().enumerate() {
-        if segment_cell(ui, label, **state, *enabled, i == 0).clicked() && *enabled {
+    for (i, (label, state, enabled, tip)) in segs.iter_mut().enumerate() {
+        if segment_cell(ui, label, **state, *enabled, i == 0, tip).clicked() && *enabled {
             **state = !**state;
         }
     }
@@ -798,11 +804,11 @@ fn segmented_toggles(ui: &mut egui::Ui, segs: &mut [(&str, &mut bool, bool)]) {
 }
 
 /// Segmented single-choice (exactly one active).
-fn segmented_choice<T: PartialEq + Copy>(ui: &mut egui::Ui, segs: &[(&str, T)], current: T, out: &mut T) {
+fn segmented_choice<T: PartialEq + Copy>(ui: &mut egui::Ui, segs: &[(&str, T, &str)], current: T, out: &mut T) {
     let prev = ui.spacing().item_spacing;
     ui.spacing_mut().item_spacing.x = 0.0;
-    for (i, (label, val)) in segs.iter().enumerate() {
-        if segment_cell(ui, label, *val == current, true, i == 0).clicked() {
+    for (i, (label, val, tip)) in segs.iter().enumerate() {
+        if segment_cell(ui, label, *val == current, true, i == 0, tip).clicked() {
             *out = *val;
         }
     }
@@ -956,66 +962,32 @@ fn table_header(ui: &mut egui::Ui, app: &mut App, cols: &Cols) {
     let th = |x: f32, s: &str, col: Color32| {
         ui.painter().text(Pos2::new(x + CELL_PAD, y), Align2::LEFT_CENTER, s, font.clone(), col);
     };
+    let _ = th; // header cells now drawn via header_cell
     let young = app.young_evidence_hours().is_some();
     let usage_hidden = app.phase == Phase::NeedsEnable;
-    th(cols.name.0, "Rule", c);
-    th(cols.dir.0, "Dir", c);
-    th(cols.action.0, "Action", c);
-    th(cols.profiles.0, "Profiles", c);
-    th(cols.scope.0, "Scope", c);
+
+    // every column header is clickable to sort by it
+    if header_cell(app, ui, cols.name, rect, "Rule", Sort::Name, c).clicked() { toggle_sort(app, Sort::Name); }
+    if header_cell(app, ui, cols.dir, rect, "Dir", Sort::Dir, c).clicked() { toggle_sort(app, Sort::Dir); }
+    if header_cell(app, ui, cols.action, rect, "Action", Sort::Action, c).clicked() { toggle_sort(app, Sort::Action); }
+    if header_cell(app, ui, cols.profiles, rect, "Profiles", Sort::Profiles, c).clicked() { toggle_sort(app, Sort::Profiles); }
+    if header_cell(app, ui, cols.scope, rect, "Scope", Sort::Scope, c).clicked() { toggle_sort(app, Sort::Scope); }
+
     if usage_hidden {
-        ui.painter().text(
-            Pos2::new(cols.hits.0 + CELL_PAD, y),
-            Align2::LEFT_CENTER,
-            "Hits · Last seen · Apps",
-            font.clone(),
-            t::CB_EMPTY_BORDER,
-        );
-        ui.painter().text(
-            Pos2::new(cols.hits.0 + 128.0, y),
-            Align2::LEFT_CENTER,
-            "requires auditing",
-            t::italic(11.0),
-            t::CB_EMPTY_BORDER,
-        );
+        ui.painter().text(Pos2::new(cols.hits.0 + CELL_PAD, y), Align2::LEFT_CENTER, "Hits · Last seen · Apps", font.clone(), t::CB_EMPTY_BORDER);
+        ui.painter().text(Pos2::new(cols.hits.0 + 128.0, y), Align2::LEFT_CENTER, "requires auditing", t::italic(11.0), t::CB_EMPTY_BORDER);
     } else {
-        // hits header: clickable sort + young-evidence tint (leave 1px at the
-        // bottom so the header's bottom border still shows through the fill)
-        let hits_rect = Rect::from_min_size(Pos2::new(cols.hits.0, rect.top()), Vec2::new(cols.hits.1, HEADER_H));
-        let last_rect = Rect::from_min_size(Pos2::new(cols.last.0, rect.top()), Vec2::new(cols.last.1, HEADER_H));
+        // young-evidence tint on hits/last (inset 1px so the bottom border shows)
         if young {
-            let inset = |r: Rect| Rect::from_min_max(r.min, Pos2::new(r.right(), r.bottom() - 1.0));
-            ui.painter().rect_filled(inset(hits_rect), 0.0, t::ADVISORY_BG);
-            ui.painter().rect_filled(inset(last_rect), 0.0, t::ADVISORY_BG);
+            let inset = |c: (f32, f32)| Rect::from_min_max(Pos2::new(c.0, rect.top()), Pos2::new(c.0 + c.1, rect.bottom() - 1.0));
+            ui.painter().rect_filled(inset(cols.hits), 0.0, t::ADVISORY_BG);
+            ui.painter().rect_filled(inset(cols.last), 0.0, t::ADVISORY_BG);
         }
-        let hits_col = if young { t::ADVISORY_HEADER } else { t::INK };
-        th(cols.hits.0, "Hits A / B", hits_col);
-        // sort/young indicator triangle after the label
-        let hg = ui.painter().layout_no_wrap("Hits A / B".into(), font.clone(), hits_col);
-        let ax = cols.hits.0 + CELL_PAD + hg.size().x + 7.0;
-        if young {
-            glyph::warn_tri(ui.painter(), Pos2::new(ax, y), 8.0, t::ADVISORY);
-        } else if app.sort == Sort::Hits {
-            if app.sort_asc {
-                glyph::tri_up(ui.painter(), Pos2::new(ax, y), 8.0, hits_col);
-            } else {
-                glyph::tri_down(ui.painter(), Pos2::new(ax, y), 8.0, hits_col);
-            }
-        }
-        th(cols.last.0, "Last seen", if young { t::ADVISORY_HEADER } else { c });
-        th(cols.apps.0, "Apps observed", c);
-        th(cols.listen.0, "Listening now", c);
-        // sort interactions
-        if ui.interact(hits_rect, ui.id().with("sort_hits"), Sense::click()).clicked() {
-            toggle_sort(app, Sort::Hits);
-        }
-        if ui.interact(last_rect, ui.id().with("sort_last"), Sense::click()).clicked() {
-            toggle_sort(app, Sort::LastSeen);
-        }
-    }
-    let name_rect = Rect::from_min_size(Pos2::new(cols.name.0, rect.top()), Vec2::new(cols.name.1, HEADER_H));
-    if ui.interact(name_rect, ui.id().with("sort_name"), Sense::click()).clicked() {
-        toggle_sort(app, Sort::Name);
+        let usage_col = if young { t::ADVISORY_HEADER } else { c };
+        if header_cell(app, ui, cols.hits, rect, "Hits A / B", Sort::Hits, if young { t::ADVISORY_HEADER } else { t::INK }).clicked() { toggle_sort(app, Sort::Hits); }
+        if header_cell(app, ui, cols.last, rect, "Last seen", Sort::LastSeen, usage_col).clicked() { toggle_sort(app, Sort::LastSeen); }
+        if header_cell(app, ui, cols.apps, rect, "Apps observed", Sort::Apps, c).clicked() { toggle_sort(app, Sort::Apps); }
+        if header_cell(app, ui, cols.listen, rect, "Listening now", Sort::Listening, c).clicked() { toggle_sort(app, Sort::Listening); }
     }
     // column separators
     for x in [cols.name.0, cols.dir.0, cols.action.0, cols.profiles.0, cols.scope.0, cols.hits.0, cols.last.0, cols.apps.0, cols.listen.0] {
@@ -1032,8 +1004,31 @@ fn toggle_sort(app: &mut App, key: Sort) {
         app.sort_asc = !app.sort_asc;
     } else {
         app.sort = key;
-        app.sort_asc = matches!(key, Sort::Name); // names A→Z, counts/time high→low
+        app.sort_asc = key.default_ascending();
     }
+}
+
+/// Draw a clickable column header: label at `x` (indented), plus the active
+/// sort arrow after it. Returns the click response for the whole cell.
+fn header_cell(app: &mut App, ui: &mut egui::Ui, col: (f32, f32), rect: Rect, label: &str, key: Sort, color: Color32) -> egui::Response {
+    let font = t::semibold(11.0);
+    let y = rect.center().y;
+    ui.painter().text(Pos2::new(col.0 + CELL_PAD, y), Align2::LEFT_CENTER, label, font.clone(), color);
+    if app.sort == key {
+        let g = ui.painter().layout_no_wrap(label.to_string(), font, color);
+        let ax = col.0 + CELL_PAD + g.size().x + 7.0;
+        if app.sort_asc {
+            glyph::tri_up(ui.painter(), Pos2::new(ax, y), 8.0, color);
+        } else {
+            glyph::tri_down(ui.painter(), Pos2::new(ax, y), 8.0, color);
+        }
+    }
+    let cell = Rect::from_min_size(Pos2::new(col.0, rect.top()), Vec2::new(col.1, HEADER_H));
+    let resp = ui.interact(cell, ui.id().with(("sort", label)), Sense::click());
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp
 }
 
 fn row(app: &mut App, ui: &mut egui::Ui, ri: usize, rect: Rect, cols: &Cols, resp: egui::Response) {
