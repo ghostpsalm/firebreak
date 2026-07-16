@@ -8,11 +8,18 @@ are actually being matched, by which applications, and how often** — so
 unused rules can be disabled and used-but-broad rules can be security-vetted.
 
 It works by correlating Windows' own WFP audit events (Security log 5156
-allowed / 5157 blocked, which carry the application path and the WFP Filter
-Run-Time ID) against the live WFP filter table and `Get-NetFirewallRule`.
-See `ARCHITECTURE.md` for the full design and rationale.
+allowed / 5157 blocked) against the live WFP filter table and
+`Get-NetFirewallRule`.
 
-## Build
+## Download
+
+Grab the latest `firebreak.exe` from the
+[**Releases**](https://github.com/ghostpsalm/firebreak/releases/latest) page
+and run it. Windows may warn on the unsigned binary — SmartScreen → *More
+info → Run anyway*. Firebreak can also update itself in place (**About → Check
+for updates**).
+
+## Build from source
 
 Native on Windows: `cargo build --release`
 Cross from Linux: `cargo build --release --target x86_64-pc-windows-gnu`
@@ -21,9 +28,9 @@ Cross from Linux: `cargo build --release --target x86_64-pc-windows-gnu`
 ## Run
 
 Double-click the exe — an embedded `requireAdministrator` manifest brings up
-the UAC prompt (with a ShellExecute "runas" fallback if launched some other
-way). The app boots straight to the rule table; everything else happens on
-background workers:
+the UAC prompt (Firebreak needs admin for audit policy, the Security log, and
+WFP access). The app boots straight to the rule table; everything else happens
+on background workers:
 
 1. **First run (auditing off):** the header shows an **Enable connection
    auditing** button. Clicking it records the pre-existing audit state and
@@ -42,59 +49,26 @@ background workers:
    the rerun cannot double-count.
 
 Headless flags (attach to the launching terminal): `--enable-only`, `--no-ui`
-(text report), `--dump-filters` (diagnostics, see below), `--restore-audit`
-(revert audit policy + log size to the recorded pre-firebreak state),
-`--ui-preview` (mock-data UI), `--db <path>`.
+(text report), `--dump-filters` (diagnostics), `--restore-audit` (revert audit
+policy + log size to the recorded pre-Firebreak state), `--ui-preview`
+(mock-data UI), `--db <path>`.
 
-The table shows, per rule: profile tags (with Domain/Private/Public view
-filters — default view is **enabled rules only**), scope
-(protocol/ports/program), allow/block hit counts, last-seen time, the
-applications observed hitting it (friendly names from PE version info),
-**which process is currently listening** on an inbound rule's ports
-(netstat-style, via Get-NetTCPConnection/-NetUDPEndpoint), and static
-baseline flags (mDNS/SSDP/LLMNR/RDP/SMB/broad-allow…). Collapsible bottom
-panels list all active listening sockets and the unattributed events with
-the WFP filter names they matched. Checkboxes set the intended
-enabled-state; **Apply** runs on a background thread: it first writes a full
-policy backup to `%ProgramData%\firebreak\backups\firewall-<stamp>.wfw`
-(restore with `netsh advfirewall import <file>`) plus a JSON rule dump, then
-commits via `Set-NetFirewallRule` in chunks of 100 (nothing is applied if
-the backup fails).
+## What you see
 
-## Attribution model (what makes the numbers trustworthy)
+Per rule: profile tags (with Domain/Private/Public view filters — default view
+is **enabled rules only**), scope (protocol/ports/program), allow/block hit
+counts, last-seen time, the applications observed hitting it, and **which
+process is currently listening** on an inbound rule's ports. Collapsible bottom
+panels list all active listening sockets and the unattributed events with the
+WFP filter names they matched.
 
-- WFP filter run-time IDs are only valid within one boot session. firebreak
-  enumerates boot times from the System log (event 6005) and resolves each
-  event against the filter map of *its own* session: the live WFP
-  enumeration for current-boot events, per-session mappings recorded by
-  earlier runs for older ones. Events from a boot during which the tool
-  never ran are reported as unattributed rather than guessed.
-- Filter→rule matching uses anchored tokens from the filter's providerData
-  (exact InstanceID equality, never substring), falling back to display-name
-  equality only when the display name is unambiguous.
-- **Unattributed events** are normal — and for blocked traffic, expected:
-  port scans, pings against closed services, and other unsolicited traffic
-  match WFP's built-in *default block* filters, which are not firewall
-  rules. The Unattributed panel shows each filter's recorded name (e.g.
-  "Default Inbound Block") so these are distinguishable from genuine
-  attribution gaps. Rule attribution is exercised by *allowed* traffic.
-  Running the tool at least once per boot session keeps attribution tight.
-- Local audit policy can be reverted by **Group Policy** refresh. If event
-  ingestion drops to zero unexpectedly:
-  `auditpol /get /subcategory:{0CCE9226-69AE-11D9-BED3-505054503030}`
+Checkboxes set the intended enabled-state; **Apply** runs on a background
+thread and first writes a full policy backup to
+`%ProgramData%\firebreak\backups\firewall-<stamp>.wfw` (restore with
+`netsh advfirewall import <file>`) before committing via `Set-NetFirewallRule`
+— nothing is applied if the backup fails.
 
-## Security posture
-
-- Data directory (`%ProgramData%\firebreak`) is created with an explicit
-  SYSTEM+Administrators-only DACL; a pre-existing directory is refused
-  unless owned by SYSTEM/Administrators (defeats pre-creation tampering
-  with the DB/backups an admin acts on).
-- All spawned system tools (powershell, netsh, auditpol, wevtutil) are
-  invoked by absolute `%SystemRoot%\System32` path, never PATH search.
-- All SQL is parameterized; PowerShell scripts go via `-EncodedCommand`
-  with proper quote escaping.
-
-## Interpreting results
+## Caveats
 
 - **Zero-hit enabled rules** are disable candidates — but only after the
   collection window has covered weekly/monthly-cadence activity (backup
@@ -102,45 +76,18 @@ the backup fails).
 - A **coverage-gap warning** means the log's oldest surviving record is past
   the checkpoint: log rollover, a cleared log, or a period with auditing
   disabled. Zero-hit conclusions are weaker across such a gap.
+- **Attribution is per-boot.** Run Firebreak at least once per boot session
+  for tight attribution. Unattributed events are normal — and for blocked
+  traffic, expected (port scans and other unsolicited traffic match WFP's
+  built-in default-block filters, which aren't firewall rules).
+- Local audit policy can be reverted by **Group Policy** refresh. If event
+  ingestion drops to zero unexpectedly, re-check with:
+  `auditpol /get /subcategory:{0CCE9226-69AE-11D9-BED3-505054503030}`
 
-## Verification checklist (built blind — confirm on a real box)
-
-This was written without access to a Windows host. All logic that can run
-cross-platform is unit-tested (22 tests), but the following Windows-side
-behaviors are from documentation/memory and are the first things to verify:
-
-1. **Filter→rule mapping (the load-bearing one).** Run `firebreak
-   --dump-filters`, take a `FilterRTID` from a real 5156 event (Event
-   Viewer → Security), and check what the matching filter's
-   `provider_data_utf16` actually contains. Matching tries (a) anchored
-   providerData tokens equal to a rule's unique Name/InstanceID, then
-   (b) filter display-name == rule DisplayName (only when unambiguous). If
-   real providerData tokens have a different shape, adjust
-   `candidate_tokens`/`build_filter_rule_map` in `src/filter_map.rs`.
-2. **Direction tokens**: `%%14592`=Inbound / `%%14593`=Outbound assumed
-   (`decode_direction` in `src/event_query.rs`). Unrecognized tokens pass
-   through raw, so a mistake is visible, not silent.
-3. **Boot markers**: System log event 6005 with provider name `EventLog` is
-   used to delimit boot sessions (`boot_times`). If none are found the tool
-   warns and treats everything as the current boot.
-4. **auditpol by GUID**: subcategory
-   `{0CCE9226-69AE-11D9-BED3-505054503030}` — GUID form used to dodge
-   localized names; confirm the braces survive as-is.
-5. **wevtutil maxSize parsing** (`security_log_max_bytes`): expects a
-   `maxSize: <n>` line from `wevtutil gl Security`.
-6. **PowerShell JSON shape** (`enumerate_rules`): `Get-NetFirewallRule`
-   joined with `-All` application/port filters by InstanceID; check the
-   port/program columns populate for a few known rules.
-7. **Secured directory creation** (`secure_dir.rs`): confirm first elevated
-   run creates `%ProgramData%\firebreak` owned by Administrators and that a
-   directory pre-created by a non-admin user is refused.
-8. **First run end-to-end**: enable → generate traffic (browse somewhere) →
-   rerun → the browser's rule shows hits with the right app name.
-
-## What this tool deliberately is not
+## What Firebreak is not
 
 - Not a packet-capture or WFP callout driver — Windows already records
   everything needed; this only reads it.
 - Not per-packet accounting: "Filtering Platform Connection" auditing is
   per-connection/flow. The per-packet subcategory ("Filtering Platform
-  Packet Drop", {0CCE9225-…}) is intentionally never enabled.
+  Packet Drop") is intentionally never enabled.
