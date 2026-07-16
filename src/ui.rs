@@ -875,7 +875,7 @@ fn native_options() -> eframe::NativeOptions {
             .with_decorations(false) // custom title bar (see paint::titlebar)
             .with_resizable(true)
             .with_icon(std::sync::Arc::new(app_icon()))
-            .with_title("firebreak"),
+            .with_title("Firebreak"),
         ..Default::default()
     }
 }

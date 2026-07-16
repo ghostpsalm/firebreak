@@ -197,7 +197,7 @@ fn titlebar(app: &mut App, ctx: &egui::Context) {
             let logo_rect = Rect::from_min_size(Pos2::new(rect.left() + 10.0, rect.center().y - 9.0), Vec2::splat(18.0));
             p.image(logo.id(), logo_rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
             let name_pos = Pos2::new(logo_rect.right() + 8.0, rect.center().y);
-            let name_galley = p.layout_no_wrap("firebreak".to_string(), t::semibold(12.0), t::INK());
+            let name_galley = p.layout_no_wrap("Firebreak".to_string(), t::semibold(12.0), t::INK());
             p.galley(Pos2::new(name_pos.x, name_pos.y - name_galley.size().y / 2.0), name_galley.clone(), t::INK());
             let host = if app.ctx_info.hostname.is_empty() { String::new() } else { format!(" · {}", app.ctx_info.hostname) };
             // catchline sits just after the name (small fixed gap), not floated far right
@@ -457,7 +457,7 @@ fn settings_menu(app: &mut App, _ui: &mut egui::Ui, ctx: &egui::Context, anchor:
                     app.settings_open = false;
                     app.spawn_update_check(ctx.clone());
                 }
-                if menu_item(ui, "About firebreak", true) {
+                if menu_item(ui, "About Firebreak", true) {
                     app.about_open = true;
                     app.settings_open = false;
                 }
@@ -578,15 +578,20 @@ fn about_box(app: &mut App, ctx: &egui::Context) {
                 ui.painter().image(logo.id(), r, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
                 ui.add_space(8.0);
                 ui.vertical(|ui| {
-                    ui.label(egui::RichText::new("firebreak").font(t::semibold(15.0)).color(t::INK()));
+                    ui.label(egui::RichText::new("Firebreak").font(t::semibold(15.0)).color(t::INK()));
                     ui.label(egui::RichText::new(format!("Version {}", crate::pipeline::version_string())).font(t::mono(11.0)).color(t::SECONDARY()));
                 });
             });
             ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                ui.add_space(20.0);
+                ui.label(egui::RichText::new("Observe first. Enforce with confidence.").font(t::semibold(11.5)).color(t::ACCENT()));
+            });
+            ui.add_space(2.0);
             for line in [
-                "Windows Firewall rule-usage auditor.",
-                "Correlates WFP connection audit events (5156/5157)",
-                "with firewall rules to find unused and over-broad rules.",
+                "Turn real network activity into least-privilege firewall policy.",
+                "Correlates WFP connection audit events (5156/5157) with firewall",
+                "rules to find unused and over-broad rules.",
             ] {
                 ui.horizontal(|ui| {
                     ui.add_space(20.0);
