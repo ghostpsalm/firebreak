@@ -222,6 +222,9 @@ pub struct App {
     about_open: bool,
     /// lazily-loaded app logo for the title bar
     pub(crate) logo: Option<egui::TextureHandle>,
+    /// scratch DB for the current .evtx import session (persists across
+    /// "Add" imports so multiple machines can be reviewed together)
+    import_db: Option<PathBuf>,
 }
 
 impl App {
@@ -258,6 +261,7 @@ impl App {
             settings_open: false,
             about_open: false,
             logo: None,
+            import_db: None,
         }
     }
 
@@ -330,7 +334,14 @@ impl App {
     }
 
     /// Analyze events from an imported .evtx file on a worker thread.
-    fn spawn_import(&mut self, path: PathBuf, egui_ctx: egui::Context) {
+    /// `append` = add to the current import session; otherwise start fresh.
+    fn spawn_import(&mut self, path: PathBuf, append: bool, egui_ctx: egui::Context) {
+        // stable per-process import scratch DB
+        let db = self.import_db.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("firebreak-import-{}.db", std::process::id()))
+        });
+        self.import_db = Some(db.clone());
+        let reset_first = !append;
         self.phase = Phase::Loading;
         self.audit_checked = true;
         self.progress = "Importing events…".into();
@@ -345,13 +356,27 @@ impl App {
                     ctx.request_repaint();
                 }
             };
-            let msg = match pipeline::import_evtx(&path, &progress) {
+            let msg = match pipeline::import_evtx(&db, &path, reset_first, &progress) {
                 Ok(r) => WorkerMsg::Ready(Box::new(r)),
                 Err(e) => WorkerMsg::Failed(format!("{e:#}")),
             };
             let _ = tx.send(msg);
             egui_ctx.request_repaint();
         });
+    }
+
+    /// Turn off Filtering Platform Connection auditing and return to the
+    /// first-run (auditing-off) view. Live collection stops.
+    fn stop_auditing(&mut self, egui_ctx: &egui::Context) {
+        let _ = crate::audit_control::set_auditing(crate::audit_control::AuditState {
+            success: false,
+            failure: false,
+        });
+        self.import_db = None;
+        if let Some(db) = self.db_path.clone() {
+            self.phase = Phase::Loading;
+            self.spawn_detect(db, egui_ctx.clone());
+        }
     }
 
     fn new_ready(
@@ -366,7 +391,7 @@ impl App {
         app.ctx_info = ctx_info;
         app.unmatched = unmatched;
         app.listeners = listeners;
-        app.drawer_open = true;
+        app.drawer_open = false; // starts collapsed
         app.audit_checked = true;
         app.progress.clear();
         // preview-only state overrides for screenshotting non-default screens
@@ -452,9 +477,6 @@ impl App {
                     // show cached rules immediately; phase stays Loading so
                     // the header still signals a refresh is in flight
                     self.absorb(*r);
-                    if !self.rows.is_empty() {
-                        self.drawer_open = true;
-                    }
                 }
                 WorkerMsg::NeedsEnable(r) => {
                     self.absorb(*r);
@@ -466,7 +488,6 @@ impl App {
                     let un = r.ctx.unmatched_events;
                     self.absorb(*r);
                     self.phase = Phase::Ready;
-                    self.drawer_open = self.drawer_open || !self.rows.is_empty();
                     self.status = format!("Ingested {ev} events ({un} unattributed).");
                     self.worker_rx = None;
                 }

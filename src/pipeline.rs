@@ -107,22 +107,14 @@ pub fn restore_audit_state(store: &Store) -> Result<String> {
     Ok(msg)
 }
 
-/// A file on the Desktop (falls back to the working dir) with a timestamped
-/// name and the given extension.
-fn desktop_file(stem: &str, ext: &str) -> PathBuf {
+/// Default CSV filename for the save dialog.
+pub fn default_csv_name() -> String {
     let stamp = Utc::now().format("%Y%m%dT%H%M%SZ");
-    let dir = std::env::var("USERPROFILE")
-        .map(|p| Path::new(&p).join("Desktop"))
-        .ok()
-        .filter(|d| d.exists())
-        .unwrap_or_else(|| PathBuf::from("."));
-    dir.join(format!("{stem}-{stamp}.{ext}"))
+    format!("firebreak-usage-{stamp}.csv")
 }
 
-/// Export every rule row (as currently analyzed) to CSV for external
-/// filtering/reporting. Returns the written path.
-pub fn export_csv(rows: &[ui::RuleRow]) -> Result<PathBuf> {
-    let path = desktop_file("firebreak-usage", "csv");
+/// Export every rule row (as currently analyzed) to CSV at `path`.
+pub fn export_csv(rows: &[ui::RuleRow], path: &Path) -> Result<()> {
     let mut out = String::new();
     out.push_str("Rule,DisplayName,Direction,Action,Profiles,Scope,Enabled,Allow,Block,Domain(A/B),Private(A/B),Public(A/B),LastSeen,DistinctPeers,AppsObserved,ListeningNow\n");
     let cell = |s: &str| -> String {
@@ -169,24 +161,31 @@ pub fn export_csv(rows: &[ui::RuleRow]) -> Result<PathBuf> {
         out.push_str(&line);
         out.push('\n');
     }
-    std::fs::write(&path, out).with_context(|| format!("writing {}", path.display()))?;
-    Ok(path)
+    std::fs::write(path, out).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
 }
 
 /// Analyze events from an exported .evtx file (e.g. from another device)
-/// against the current host's firewall rules. Writes into a throwaway DB so
-/// it never touches the live collection.
-pub fn import_evtx(evtx_path: &Path, progress: &dyn Fn(&str)) -> Result<AnalysisResult> {
+/// against the current host's firewall rules. Writes into `scratch_db` (a
+/// dedicated import DB, never the live store). `reset_first` clears any prior
+/// import so a fresh single-file review doesn't concatenate; false appends
+/// (multi-machine review).
+pub fn import_evtx(
+    scratch_db: &Path,
+    evtx_path: &Path,
+    reset_first: bool,
+    progress: &dyn Fn(&str),
+) -> Result<AnalysisResult> {
     progress("Loading firewall rules…");
     let rules = firewall_rules::enumerate_rules()
         .ok()
         .or_else(firewall_rules::load_rules_cache)
         .context("no firewall rules available to match against")?;
 
-    // scratch DB so import never disturbs the live usage store
-    let scratch = std::env::temp_dir().join(format!("firebreak-import-{}.db", std::process::id()));
-    let _ = std::fs::remove_file(&scratch);
-    let store = Store::open(&scratch)?;
+    let store = Store::open(scratch_db)?;
+    if reset_first {
+        store.reset_ingestion()?;
+    }
 
     let scope_index = crate::scope::ScopeIndex::build(&rules);
     let iface_profiles = firewall_rules::interface_profile_map();
@@ -218,7 +217,6 @@ pub fn import_evtx(evtx_path: &Path, progress: &dyn Fn(&str)) -> Result<Analysis
     });
     if let Err(e) = ingest {
         let _ = store.rollback();
-        let _ = std::fs::remove_file(&scratch);
         return Err(e).context("reading .evtx file");
     }
     for (id, label) in &bucket_labels {
@@ -231,8 +229,7 @@ pub fn import_evtx(evtx_path: &Path, progress: &dyn Fn(&str)) -> Result<Analysis
     let all_usage = store.all_usage()?;
     let rows = build_rows(rules, &all_usage, &listener_list);
     let unmatched = build_unmatched(&store)?;
-    drop(store);
-    let _ = std::fs::remove_file(&scratch);
+    // scratch DB is kept for the session so further "Add" imports accumulate
 
     let name = evtx_path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
     Ok(AnalysisResult {

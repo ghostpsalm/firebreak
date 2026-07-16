@@ -243,6 +243,12 @@ fn header(app: &mut App, ctx: &egui::Context) {
                         .map(time_util::since_with_age)
                         .unwrap_or_else(|| "just now".into());
                     stat(ui, "Auditing active", &format!("Since {since}"));
+                    ui.add_space(8.0);
+                    // Stop control — disables auditing (and returns to the
+                    // first-run view, handy for testing that state too)
+                    if flat_button(ui, "Stop").clicked() {
+                        app.stop_auditing(ctx);
+                    }
                 } else {
                     stat(ui, "Auditing is off", "No connection data has ever been collected");
                 }
@@ -264,11 +270,25 @@ fn header(app: &mut App, ctx: &egui::Context) {
 
                     divider(ui);
                     let gap = !app.ctx_info.note.is_empty();
-                    stat(
-                        ui,
-                        if gap { "Coverage gap" } else { "Coverage complete" },
-                        if gap { "See Warning below" } else { "No gaps detected in Audit Log" },
-                    );
+                    let young = app.young_evidence_hours().is_some();
+                    let value = if gap { "Coverage gap" } else { "Coverage complete" };
+                    if young && app.warning_acked {
+                        // warning persists but was dismissed — offer to reopen it
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 1.0;
+                            ui.label(egui::RichText::new(value).font(t::semibold(12.0)).color(t::INK));
+                            if link(ui, "See warning", t::ADVISORY_HEADER).clicked() {
+                                app.warning_acked = false;
+                            }
+                        });
+                    } else {
+                        let caption = if gap || young {
+                            "See warning below"
+                        } else {
+                            "No gaps detected in Audit Log"
+                        };
+                        stat(ui, value, caption);
+                    }
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -427,22 +447,59 @@ fn open_data_folder() {
     }
 }
 
+#[cfg(windows)]
 fn do_export_csv(app: &mut App) {
-    match crate::pipeline::export_csv(&app.rows) {
-        Ok(p) => app.status = format!("Exported {} rules → {}", app.rows.len(), p.display()),
-        Err(e) => app.status = format!("CSV export failed: {e:#}"),
+    let default = crate::pipeline::default_csv_name();
+    if let Some(path) = rfd::FileDialog::new()
+        .add_filter("CSV", &["csv"])
+        .set_file_name(&default)
+        .set_title("Export rule usage to CSV")
+        .save_file()
+    {
+        app.status = match crate::pipeline::export_csv(&app.rows, &path) {
+            Ok(()) => format!("Exported {} rules → {}", app.rows.len(), path.display()),
+            Err(e) => format!("CSV export failed: {e:#}"),
+        };
     }
+}
+
+#[cfg(not(windows))]
+fn do_export_csv(app: &mut App) {
+    // preview/dev: no dialog — write next to the working dir
+    let path = std::path::PathBuf::from(crate::pipeline::default_csv_name());
+    app.status = match crate::pipeline::export_csv(&app.rows, &path) {
+        Ok(()) => format!("Exported {} rules → {}", app.rows.len(), path.display()),
+        Err(e) => format!("CSV export failed: {e:#}"),
+    };
 }
 
 #[cfg(windows)]
 fn do_import_evtx(app: &mut App, ctx: &egui::Context) {
-    if let Some(path) = rfd::FileDialog::new()
+    let Some(path) = rfd::FileDialog::new()
         .add_filter("Windows event log", &["evtx"])
         .set_title("Import a saved Security .evtx")
         .pick_file()
-    {
-        app.spawn_import(path, ctx.clone());
-    }
+    else {
+        return;
+    };
+    // if an import session is already open, ask whether to add or start fresh
+    let append = if app.import_db.is_some() {
+        match rfd::MessageDialog::new()
+            .set_title("Import events")
+            .set_description(
+                "Add these events to the current import (for reviewing multiple machines \
+                 together)?\n\nYes = add · No = start a new import from just this file.",
+            )
+            .set_buttons(rfd::MessageButtons::YesNo)
+            .show()
+        {
+            rfd::MessageDialogResult::Yes => true,
+            _ => false,
+        }
+    } else {
+        false
+    };
+    app.spawn_import(path, append, ctx.clone());
 }
 
 #[cfg(not(windows))]
