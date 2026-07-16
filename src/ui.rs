@@ -359,6 +359,7 @@ impl App {
                 }
             }
             Ok("modal") => app.confirm_open = true,
+            Ok("settings") => app.settings_open = true,
             Ok("selected") => app.selected = Some(0),
             Ok("profiles") => {
                 // demo: remove Public from a multi-profile rule + a disable

@@ -3,7 +3,7 @@
 //! table is custom-painted for exact grid, checkbox-intent, chip, and
 //! accent-edge fidelity.
 
-use super::{cell_text, interactive_chip, App, ChangeKind, DirFilter, Phase, PlannedChange, Sort, Tab};
+use super::{cell_text, interactive_chip, App, DirFilter, Phase, Sort, Tab};
 use crate::listeners::{self, Listener};
 use crate::theme::{self as t};
 use crate::time_util;
@@ -98,9 +98,22 @@ mod glyph {
         p.line_segment([Pos2::new(center.x - 5.0, center.y), Pos2::new(center.x + 5.0, center.y)], Stroke::new(1.2, color));
     }
 
-    pub fn restore(p: &egui::Painter, center: Pos2, color: Color32) {
+    /// Windowed → offer maximize: a single square.
+    pub fn maximize(p: &egui::Painter, center: Pos2, color: Color32) {
         let r = Rect::from_center_size(center, Vec2::splat(9.0));
         p.rect_stroke(r, 0.0, Stroke::new(1.2, color));
+    }
+
+    /// Maximized → offer restore: two overlapping squares.
+    pub fn restore(p: &egui::Painter, center: Pos2, color: Color32) {
+        let s = 7.5;
+        // back square (top-right)
+        let back = Rect::from_min_size(Pos2::new(center.x - s / 2.0 + 2.0, center.y - s / 2.0 - 2.0), Vec2::splat(s));
+        p.rect_stroke(back, 0.0, Stroke::new(1.1, color));
+        // front square (bottom-left), painted over with the panel fill behind
+        let front = Rect::from_min_size(Pos2::new(center.x - s / 2.0 - 2.0, center.y - s / 2.0 + 2.0), Vec2::splat(s));
+        p.rect_filled(front, 0.0, crate::theme::TITLEBAR);
+        p.rect_stroke(front, 0.0, Stroke::new(1.1, color));
     }
 }
 
@@ -164,10 +177,14 @@ fn titlebar(app: &mut App, ctx: &egui::Context) {
             p.text(Pos2::new(logo_rect.right() + 76.0, rect.center().y), Align2::LEFT_CENTER, format!("— Windows Firewall usage audit{host}"), t::sans(11.0), t::FAINT);
 
             // min / max / close — each a 46px hit target
+            let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
             for i in 0..3u8 {
                 let bx = Rect::from_min_size(Pos2::new(rect.right() - 46.0 * (3.0 - i as f32), rect.top()), Vec2::new(46.0, TITLEBAR_H));
                 let r = ui.interact(bx, ui.id().with(("winbtn", i)), Sense::click());
                 let hovered = r.hovered();
+                if hovered {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
                 let is_close = i == 2;
                 if hovered {
                     ui.painter().rect_filled(bx, 0.0, if is_close { t::DESTRUCTIVE } else { Color32::from_rgb(0xDD, 0xE1, 0xE6) });
@@ -176,16 +193,19 @@ fn titlebar(app: &mut App, ctx: &egui::Context) {
                 let c = bx.center();
                 match i {
                     0 => glyph::minimize(ui.painter(), c, col),
-                    1 => glyph::restore(ui.painter(), c, col),
+                    1 => {
+                        if maximized {
+                            glyph::restore(ui.painter(), c, col);
+                        } else {
+                            glyph::maximize(ui.painter(), c, col);
+                        }
+                    }
                     _ => glyph::cross(ui.painter(), c, 9.0, col),
                 }
                 if r.clicked() {
                     match i {
                         0 => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
-                        1 => {
-                            let maxed = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maxed));
-                        }
+                        1 => ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized)),
                         _ => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
                     }
                 }
@@ -294,9 +314,30 @@ fn flat_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
     let galley = ui.painter().layout_no_wrap(label.to_string(), t::sans(12.0), t::INK);
     let size = Vec2::new(galley.size().x + 24.0, galley.size().y + 10.0);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
-    let fill = if resp.hovered() { Color32::WHITE } else { t::RAISED };
-    ui.painter().rect(rect, 0.0, fill, Stroke::new(1.0, t::CONTROL_BORDER));
+    let (fill, border) = if resp.is_pointer_button_down_on() {
+        (t::CHROME, t::ACCENT)
+    } else if resp.hovered() {
+        (Color32::WHITE, t::ACCENT)
+    } else {
+        (t::RAISED, t::CONTROL_BORDER)
+    };
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    ui.painter().rect(rect, 0.0, fill, Stroke::new(1.0, border));
     ui.painter().galley(rect.center() - galley.size() / 2.0, galley, t::INK);
+    resp
+}
+
+/// A text link that shows the hand cursor and underlines/darkens on hover.
+fn link(ui: &mut egui::Ui, label: &str, color: Color32) -> egui::Response {
+    let resp = ui.add(
+        egui::Label::new(egui::RichText::new(label).font(t::sans(12.0)).color(color).underline())
+            .sense(Sense::click()),
+    );
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
     resp
 }
 
@@ -316,7 +357,7 @@ fn settings_menu(app: &mut App, _ui: &mut egui::Ui, ctx: &egui::Context, anchor:
             .show(ui, |ui| {
                 ui.set_width(202.0);
                 let ready = app.phase == Phase::Ready && app.db_path.is_some();
-                if menu_item(ui, "Export usage to CSV…", ready) {
+                if menu_item(ui, "Export usage to CSV…", app.phase == Phase::Ready && !app.rows.is_empty()) {
                     do_export_csv(app);
                     app.settings_open = false;
                 }
@@ -343,7 +384,18 @@ fn settings_menu(app: &mut App, _ui: &mut egui::Ui, ctx: &egui::Context, anchor:
                     }
                     app.settings_open = false;
                 }
+                if menu_item(ui, "Open data folder", true) {
+                    open_data_folder();
+                    app.settings_open = false;
+                }
                 ui.separator();
+                if menu_item(ui, "Check for updates…", true) {
+                    app.status = format!(
+                        "firebreak {} — no update channel configured; check your source for newer builds.",
+                        env!("CARGO_PKG_VERSION")
+                    );
+                    app.settings_open = false;
+                }
                 if menu_item(ui, "About firebreak", true) {
                     app.about_open = true;
                     app.settings_open = false;
@@ -353,6 +405,20 @@ fn settings_menu(app: &mut App, _ui: &mut egui::Ui, ctx: &egui::Context, anchor:
     // click-away closes
     if resp.response.clicked_elsewhere() {
         app.settings_open = false;
+    }
+}
+
+fn open_data_folder() {
+    let base = std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into());
+    let dir = std::path::Path::new(&base).join("firebreak");
+    let _ = std::fs::create_dir_all(&dir);
+    #[cfg(windows)]
+    {
+        let explorer = std::path::Path::new(
+            &std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into()),
+        )
+        .join("explorer.exe");
+        let _ = crate::syspath::command(explorer).arg(&dir).spawn();
     }
 }
 
@@ -454,8 +520,11 @@ fn settings_button(ui: &mut egui::Ui) -> egui::Response {
     let galley = ui.painter().layout_no_wrap("Settings".to_string(), t::sans(12.0), t::INK);
     let size = Vec2::new(galley.size().x + 34.0, galley.size().y + 10.0);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
-    let fill = if resp.hovered() { Color32::WHITE } else { t::RAISED };
-    ui.painter().rect(rect, 0.0, fill, Stroke::new(1.0, t::CONTROL_BORDER));
+    let (fill, border) = if resp.hovered() { (Color32::WHITE, t::ACCENT) } else { (t::RAISED, t::CONTROL_BORDER) };
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    ui.painter().rect(rect, 0.0, fill, Stroke::new(1.0, border));
     ui.painter().galley(Pos2::new(rect.left() + 12.0, rect.center().y - galley.size().y / 2.0), galley, t::INK);
     glyph::tri_down(ui.painter(), Pos2::new(rect.right() - 12.0, rect.center().y), 8.0, t::TERTIARY);
     resp
@@ -488,16 +557,7 @@ fn warning_band(app: &mut App, ctx: &egui::Context, hours: f64) {
                 );
                 ui.label(job);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let ack = ui.add(
-                        egui::Label::new(
-                            egui::RichText::new("Acknowledge")
-                                .font(t::sans(11.0))
-                                .color(t::ADVISORY_HEADER)
-                                .underline(),
-                        )
-                        .sense(Sense::click()),
-                    );
-                    if ack.clicked() {
+                    if link(ui, "Acknowledge", t::ADVISORY_HEADER).clicked() {
                         app.warning_acked = true;
                     }
                 });
@@ -572,15 +632,25 @@ fn filter_bar(app: &mut App, ctx: &egui::Context) {
                 ui.set_height(CTRL_H);
                 ui.spacing_mut().item_spacing = Vec2::new(6.0, 0.0);
 
-                // search box — text indented past the magnifier so the icon
-                // sits inside the field, not over the text
-                let search = egui::TextEdit::singleline(&mut app.filter_text)
-                    .hint_text("Filter rules…")
-                    .desired_width(210.0)
-                    .font(t::sans(12.0))
-                    .margin(egui::Margin { left: 26.0, right: 8.0, top: 4.0, bottom: 4.0 });
-                let resp = ui.add_sized(Vec2::new(224.0, CTRL_H), search);
-                glyph::magnifier(ui.painter(), Pos2::new(resp.rect.left() + 12.0, resp.rect.center().y), t::FAINT);
+                // search box — reserve the field rect first, draw the
+                // magnifier at a FIXED left inset, then place the TextEdit
+                // with its text indented past the icon (no overlap, icon
+                // doesn't move with the text)
+                let (field, _) = ui.allocate_exact_size(Vec2::new(224.0, CTRL_H), Sense::hover());
+                ui.painter().rect(field, 0.0, Color32::WHITE, Stroke::new(1.0, t::CONTROL_BORDER));
+                glyph::magnifier(ui.painter(), Pos2::new(field.left() + 12.0, field.center().y), t::FAINT);
+                let text_area = Rect::from_min_max(
+                    Pos2::new(field.left() + 24.0, field.top()),
+                    Pos2::new(field.right() - 6.0, field.bottom()),
+                );
+                let mut child = ui.child_ui(text_area, egui::Layout::left_to_right(egui::Align::Center), None);
+                child.add(
+                    egui::TextEdit::singleline(&mut app.filter_text)
+                        .hint_text("Filter rules…")
+                        .desired_width(f32::INFINITY)
+                        .font(t::sans(12.0))
+                        .frame(false),
+                );
 
                 // direction filter (default In) — the primary audit lens
                 let dir = app.dir_filter;
@@ -884,9 +954,13 @@ fn row(app: &mut App, ui: &mut egui::Ui, ri: usize, rect: Rect, cols: &Cols, res
     let queued_dim = matches!(apply_status, Some(RowApply::Queued));
     let text_col = if dimmed || queued_dim { t::DISABLED } else { t::INK };
 
-    // checkbox
+    // checkbox — indeterminate when the rule stays on but its profile scope
+    // was narrowed
+    let partial = r.target_enabled
+        && !r.target_profiles.is_empty()
+        && r.target_profiles != r.orig_profiles();
     let cb_rect = Rect::from_center_size(Pos2::new(cols.check + 17.0, rect.center().y), Vec2::splat(13.0));
-    draw_checkbox(ui.painter(), cb_rect, saved_on, pending, r.target_enabled);
+    draw_checkbox(ui.painter(), cb_rect, saved_on, pending, r.target_enabled, partial);
     let cb_resp = ui.interact(cb_rect.expand(3.0), ui.id().with(("cb", ri)), Sense::click());
 
     // name (+ flag)
@@ -1071,21 +1145,35 @@ fn apps_summary(r: &super::RuleRow) -> String {
     }
 }
 
-fn draw_checkbox(p: &egui::Painter, rect: Rect, saved_on: bool, pending: bool, target: bool) {
-    let (border, fill, glyph, glyph_col) = if pending {
+enum CbMark {
+    Check,
+    Dash,
+    None,
+}
+
+/// `partial` = the rule stays enabled but its profile scope was narrowed —
+/// drawn as an indeterminate dash, the standard tri-state affordance.
+fn draw_checkbox(p: &egui::Painter, rect: Rect, saved_on: bool, pending: bool, target: bool, partial: bool) {
+    let (border, fill, mark, mark_col) = if partial {
+        (t::ACCENT, Color32::WHITE, CbMark::Dash, t::ACCENT)
+    } else if pending {
         if target {
-            (t::ACCENT, t::ACCENT, true, Color32::WHITE)
+            (t::ACCENT, t::ACCENT, CbMark::Check, Color32::WHITE)
         } else {
-            (t::ACCENT, Color32::WHITE, false, t::INK)
+            (t::ACCENT, Color32::WHITE, CbMark::None, t::INK)
         }
     } else if saved_on {
-        (t::CB_SAVED_BORDER, Color32::WHITE, true, t::INK)
+        (t::CB_SAVED_BORDER, Color32::WHITE, CbMark::Check, t::INK)
     } else {
-        (t::CB_EMPTY_BORDER, Color32::WHITE, false, t::INK)
+        (t::CB_EMPTY_BORDER, Color32::WHITE, CbMark::None, t::INK)
     };
     p.rect(rect, 0.0, fill, Stroke::new(1.5, border));
-    if glyph {
-        glyph::check(p, rect.center(), 9.0, glyph_col);
+    match mark {
+        CbMark::Check => glyph::check(p, rect.center(), 9.0, mark_col),
+        CbMark::Dash => {
+            p.hline(rect.left() + 3.0..=rect.right() - 3.0, rect.center().y, Stroke::new(2.0, mark_col));
+        }
+        CbMark::None => {}
     }
 }
 
@@ -1306,21 +1394,34 @@ fn drawer(app: &mut App, ctx: &egui::Context) {
     if app.rows.is_empty() {
         return;
     }
-    let mut panel = egui::TopBottomPanel::bottom("drawer")
-        .frame(egui::Frame::none().fill(t::RAISED));
-    // resizable only while open; height persists across frames/toggles via
-    // app.drawer_height (egui's own panel-size memory is reset by the
-    // open/close height override, so we track it ourselves)
-    if app.drawer_open {
-        let h = app.drawer_height.clamp(90.0, 520.0);
-        panel = panel
-            .resizable(true)
-            .default_height(h)
-            .height_range(90.0..=520.0);
+    // Height fully owned by app.drawer_height (persists across frames); a
+    // manual grab handle on the top edge adjusts it — no egui panel-memory
+    // to fight, so it never snaps back.
+    let panel_h = if app.drawer_open {
+        app.drawer_height.clamp(90.0, 560.0) + 6.0 // +6 for the grab strip
     } else {
-        panel = panel.resizable(false).exact_height(28.0);
-    }
-    let inner = panel.show(ctx, |ui| {
+        28.0
+    };
+    egui::TopBottomPanel::bottom("drawer")
+        .exact_height(panel_h)
+        .resizable(false)
+        .frame(egui::Frame::none().fill(t::RAISED))
+        .show(ctx, |ui| {
+            // resize grab strip (only when open)
+            if app.drawer_open {
+                let (grip, gresp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 6.0), Sense::drag());
+                if gresp.hovered() || gresp.dragged() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+                    ui.painter().hline(grip.x_range(), grip.center().y, Stroke::new(2.0, t::ACCENT_TINT_BORDER));
+                } else {
+                    ui.painter().hline(grip.x_range(), grip.center().y, Stroke::new(1.0, t::BORDER_LIGHT));
+                }
+                if gresp.dragged() {
+                    // dragging up (negative dy) grows the drawer
+                    app.drawer_height = (app.drawer_height - gresp.drag_delta().y).clamp(90.0, 560.0);
+                }
+            }
+
             // tab bar
             let bar = ui.allocate_exact_size(Vec2::new(ui.available_width(), 27.0), Sense::hover()).0;
             ui.painter().hline(bar.x_range(), bar.bottom() - 0.5, Stroke::new(1.0, t::BORDER_LIGHT));
@@ -1334,13 +1435,20 @@ fn drawer(app: &mut App, ctx: &egui::Context) {
                 let g = ui.painter().layout_no_wrap(label.clone(), if active { t::semibold(11.5) } else { t::sans(11.5) }, if active { t::INK } else { t::SECONDARY });
                 let w = g.size().x + 28.0;
                 let tab_rect = Rect::from_min_size(Pos2::new(x, bar.top()), Vec2::new(w, 27.0));
+                let hovered = ui.rect_contains_pointer(tab_rect);
                 if active {
                     ui.painter().rect_filled(tab_rect, 0.0, Color32::WHITE);
                     ui.painter().hline(tab_rect.x_range(), tab_rect.top() + 1.0, Stroke::new(2.0, t::ACCENT));
+                } else if hovered {
+                    ui.painter().rect_filled(tab_rect, 0.0, t::HOVER_WASH);
                 }
                 ui.painter().vline(tab_rect.right(), tab_rect.y_range(), Stroke::new(1.0, t::BORDER_LIGHT));
                 ui.painter().galley(tab_rect.center() - g.size() / 2.0, g, if active { t::INK } else { t::SECONDARY });
-                if ui.interact(tab_rect, ui.id().with(("tab", label)), Sense::click()).clicked() {
+                let resp = ui.interact(tab_rect, ui.id().with(("tab", label)), Sense::click());
+                if resp.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                if resp.clicked() {
                     if app.drawer_open && app.tab == tab {
                         app.drawer_open = false;
                     } else {
@@ -1350,15 +1458,26 @@ fn drawer(app: &mut App, ctx: &egui::Context) {
                 }
                 x += w;
             }
-            // collapse hint
-            let hint = if app.drawer_open { "collapse" } else { "expand" };
-            let hg = ui.painter().layout_no_wrap(hint.to_string(), t::sans(11.0), t::FAINT);
-            ui.painter().galley(Pos2::new(bar.right() - 14.0 - hg.size().x, bar.center().y - hg.size().y / 2.0), hg, t::FAINT);
-            let tc = Pos2::new(bar.right() - 14.0 - 60.0, bar.center().y);
+
+            // collapse / expand control — a real button with hover
+            let label = if app.drawer_open { "collapse" } else { "expand" };
+            let lg = ui.painter().layout_no_wrap(label.to_string(), t::sans(11.0), t::SECONDARY);
+            let ctrl_w = lg.size().x + 26.0;
+            let ctrl = Rect::from_min_size(Pos2::new(bar.right() - ctrl_w, bar.top()), Vec2::new(ctrl_w, 27.0));
+            let cresp = ui.interact(ctrl, ui.id().with("drawer_toggle"), Sense::click());
+            let ccol = if cresp.hovered() { t::INK } else { t::SECONDARY };
+            if cresp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                ui.painter().rect_filled(ctrl, 0.0, t::HOVER_WASH);
+            }
             if app.drawer_open {
-                glyph::tri_down(ui.painter(), tc, 8.0, t::FAINT);
+                glyph::tri_down(ui.painter(), Pos2::new(ctrl.left() + 9.0, bar.center().y), 8.0, ccol);
             } else {
-                glyph::tri_up(ui.painter(), tc, 8.0, t::FAINT);
+                glyph::tri_up(ui.painter(), Pos2::new(ctrl.left() + 9.0, bar.center().y), 8.0, ccol);
+            }
+            ui.painter().text(Pos2::new(ctrl.left() + 18.0, bar.center().y), Align2::LEFT_CENTER, label, t::sans(11.0), ccol);
+            if cresp.clicked() {
+                app.drawer_open = !app.drawer_open;
             }
 
             if app.drawer_open {
@@ -1369,10 +1488,6 @@ fn drawer(app: &mut App, ctx: &egui::Context) {
                 });
             }
         });
-    // remember the (possibly dragged) height so it persists across frames
-    if app.drawer_open {
-        app.drawer_height = inner.response.rect.height();
-    }
 }
 
 fn sockets_body(app: &App, ui: &mut egui::Ui) {
@@ -1502,7 +1617,7 @@ fn footer_pending(app: &mut App, ui: &mut egui::Ui, dis: usize, en: usize, scope
         }
         ui.label(job);
         ui.add_space(14.0);
-        if ui.add(egui::Label::new(egui::RichText::new("Revert all").font(t::sans(12.0)).color(t::ACCENT).underline()).sense(Sense::click())).clicked() {
+        if link(ui, "Revert all", t::ACCENT).clicked() {
             app.revert_all();
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1595,7 +1710,16 @@ fn primary_button(ui: &mut egui::Ui, label: &str, fill: Color32) -> egui::Respon
     let galley = ui.painter().layout_no_wrap(label.to_string(), t::semibold(12.0), Color32::WHITE);
     let size = Vec2::new(galley.size().x + 36.0, galley.size().y + 14.0);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
-    let f = if resp.hovered() { fill.gamma_multiply(1.1) } else { fill };
+    let f = if resp.is_pointer_button_down_on() {
+        fill.gamma_multiply(0.85)
+    } else if resp.hovered() {
+        fill.gamma_multiply(1.12)
+    } else {
+        fill
+    };
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
     ui.painter().rect_filled(rect, 0.0, f);
     ui.painter().galley(rect.center() - galley.size() / 2.0, galley, Color32::WHITE);
     resp
@@ -1613,12 +1737,14 @@ fn confirm_modal(app: &mut App, ctx: &egui::Context) {
         ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(44, 62, 80, 102));
     });
     let mut open = true;
+    // list gets up to ~55% of the window height before it scrolls
+    let list_max = (ctx.screen_rect().height() * 0.55).clamp(200.0, 520.0);
     egui::Window::new("confirm")
         .title_bar(false)
         .collapsible(false)
         .resizable(false)
-        .fixed_size(Vec2::new(600.0, 0.0))
-        .anchor(Align2::CENTER_TOP, Vec2::new(0.0, 110.0))
+        .fixed_size(Vec2::new(680.0, 0.0))
+        .anchor(Align2::CENTER_TOP, Vec2::new(0.0, 70.0))
         .frame(egui::Frame::none().fill(Color32::WHITE).stroke(Stroke::new(1.0, t::CONTROL_BORDER)))
         .show(ctx, |ui| {
             // title
@@ -1634,11 +1760,15 @@ fn confirm_modal(app: &mut App, ctx: &egui::Context) {
 
             // change rows (scrollable — a big batch shouldn't blow the modal)
             pad20(ui, |ui| {
-                egui::ScrollArea::vertical().max_height(280.0).auto_shrink([false, true]).show(ui, |ui| {
-                    for c in &plan {
-                        change_row(app, ui, c);
-                    }
-                });
+                egui::ScrollArea::vertical()
+                    .max_height(list_max)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        for c in &plan {
+                            change_row(app, ui, c);
+                        }
+                    });
             });
 
             // backup box
