@@ -22,6 +22,7 @@ fn main() {
         res.set_manifest(manifest);
         res.set("ProductName", "firebreak");
         res.set("FileDescription", "Windows Firewall rule-usage auditor");
+        res.set_icon("assets/icons/firebreak.ico"); // taskbar / Explorer icon
         if let Err(e) = res.compile() {
             println!("cargo:warning=resource embedding failed: {e}");
         }

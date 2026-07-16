@@ -200,6 +200,8 @@ pub struct App {
     drawer_height: f32,
     settings_open: bool,
     about_open: bool,
+    /// lazily-loaded app logo for the title bar
+    pub(crate) logo: Option<egui::TextureHandle>,
 }
 
 impl App {
@@ -234,7 +236,21 @@ impl App {
             drawer_height: 190.0,
             settings_open: false,
             about_open: false,
+            logo: None,
         }
+    }
+
+    /// Load (once) and return the title-bar logo texture.
+    pub(crate) fn logo_texture(&mut self, ctx: &egui::Context) -> egui::TextureHandle {
+        if let Some(t) = &self.logo {
+            return t.clone();
+        }
+        let bytes = include_bytes!("../assets/icons/firebreak-32.png");
+        let (rgba, w, h) = image_rgba(bytes).unwrap_or((vec![0; 4], 1, 1));
+        let img = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
+        let tex = ctx.load_texture("logo", img, egui::TextureOptions::LINEAR);
+        self.logo = Some(tex.clone());
+        tex
     }
 
     fn new_live(db_path: PathBuf, egui_ctx: egui::Context) -> Self {
@@ -704,6 +720,33 @@ impl eframe::App for App {
 
 // ---- entry points ----
 
+fn app_icon() -> egui::IconData {
+    // 256px PNG embedded in the binary; decoded to RGBA for the window icon
+    let bytes = include_bytes!("../assets/icons/firebreak-256.png");
+    match image_rgba(bytes) {
+        Some((rgba, w, h)) => egui::IconData { rgba, width: w, height: h },
+        None => egui::IconData { rgba: vec![0; 4], width: 1, height: 1 },
+    }
+}
+
+/// Minimal PNG → RGBA decode (avoids pulling a full image crate).
+fn image_rgba(png: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+    let decoder = png::Decoder::new(png);
+    let mut reader = decoder.read_info().ok()?;
+    let mut buf = vec![0; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).ok()?;
+    buf.truncate(info.buffer_size());
+    // ensure RGBA8
+    match info.color_type {
+        png::ColorType::Rgba => Some((buf, info.width, info.height)),
+        png::ColorType::Rgb => {
+            let rgba = buf.chunks(3).flat_map(|c| [c[0], c[1], c[2], 255]).collect();
+            Some((rgba, info.width, info.height))
+        }
+        _ => None,
+    }
+}
+
 fn native_options() -> eframe::NativeOptions {
     eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -711,6 +754,7 @@ fn native_options() -> eframe::NativeOptions {
             .with_min_inner_size([1000.0, 620.0])
             .with_decorations(false) // custom title bar (see paint::titlebar)
             .with_resizable(true)
+            .with_icon(std::sync::Arc::new(app_icon()))
             .with_title("firebreak"),
         ..Default::default()
     }

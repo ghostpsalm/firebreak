@@ -136,7 +136,8 @@ pub fn window(app: &mut App, ctx: &egui::Context) {
 
 // ---- title bar ----
 
-fn titlebar(app: &App, ctx: &egui::Context) {
+fn titlebar(app: &mut App, ctx: &egui::Context) {
+    let logo = app.logo_texture(ctx);
     egui::TopBottomPanel::top("titlebar")
         .exact_height(TITLEBAR_H)
         .frame(egui::Frame::none().fill(t::TITLEBAR))
@@ -156,11 +157,11 @@ fn titlebar(app: &App, ctx: &egui::Context) {
 
             let p = ui.painter();
             super::stroke_bottom(p, rect, t::BORDER);
-            let logo = Rect::from_min_size(Pos2::new(rect.left() + 12.0, rect.center().y - 6.0), Vec2::splat(12.0));
-            p.rect_filled(logo, 0.0, t::LOGO_RED);
-            p.text(Pos2::new(logo.right() + 8.0, rect.center().y), Align2::LEFT_CENTER, "firebreak", t::semibold(12.0), t::INK);
+            let logo_rect = Rect::from_min_size(Pos2::new(rect.left() + 10.0, rect.center().y - 9.0), Vec2::splat(18.0));
+            p.image(logo.id(), logo_rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+            p.text(Pos2::new(logo_rect.right() + 8.0, rect.center().y), Align2::LEFT_CENTER, "firebreak", t::semibold(12.0), t::INK);
             let host = if app.ctx_info.hostname.is_empty() { String::new() } else { format!(" · {}", app.ctx_info.hostname) };
-            p.text(Pos2::new(logo.right() + 74.0, rect.center().y), Align2::LEFT_CENTER, format!("— Windows Firewall usage audit{host}"), t::sans(11.0), t::FAINT);
+            p.text(Pos2::new(logo_rect.right() + 76.0, rect.center().y), Align2::LEFT_CENTER, format!("— Windows Firewall usage audit{host}"), t::sans(11.0), t::FAINT);
 
             // min / max / close — each a 46px hit target
             for i in 0..3u8 {
@@ -405,11 +406,12 @@ fn about_box(app: &mut App, ctx: &egui::Context) {
         .frame(egui::Frame::none().fill(Color32::WHITE).stroke(Stroke::new(1.0, t::CONTROL_BORDER)))
         .show(ctx, |ui| {
             ui.add_space(18.0);
+            let logo = app.logo_texture(ctx);
             ui.horizontal(|ui| {
                 ui.add_space(20.0);
-                let (r, _) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::hover());
-                ui.painter().rect_filled(r, 0.0, t::LOGO_RED);
-                ui.add_space(4.0);
+                let (r, _) = ui.allocate_exact_size(Vec2::splat(36.0), Sense::hover());
+                ui.painter().image(logo.id(), r, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+                ui.add_space(8.0);
                 ui.vertical(|ui| {
                     ui.label(egui::RichText::new("firebreak").font(t::semibold(15.0)).color(t::INK));
                     ui.label(egui::RichText::new(format!("Version {}", env!("CARGO_PKG_VERSION"))).font(t::mono(11.0)).color(t::SECONDARY));
