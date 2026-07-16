@@ -232,6 +232,16 @@ fn header(app: &mut App, ctx: &egui::Context) {
                     stat(ui, "Detecting…", "checking Windows audit policy");
                     return;
                 }
+                // enabling takes a few seconds — show progress, not "off"
+                if app.phase == Phase::Enabling {
+                    dot(ui, t::ADVISORY);
+                    ui.add_space(8.0);
+                    let cap = if app.progress.is_empty() { "please wait…".to_string() } else { app.progress.clone() };
+                    stat(ui, "Enabling auditing…", &cap);
+                    ui.add_space(10.0);
+                    ui.spinner();
+                    return;
+                }
                 let active = app.ctx_info.auditing_active;
                 dot(ui, if active { t::LIVE } else { t::CB_EMPTY_BORDER });
                 ui.add_space(8.0);
@@ -243,12 +253,13 @@ fn header(app: &mut App, ctx: &egui::Context) {
                         .map(time_util::since_with_age)
                         .unwrap_or_else(|| "just now".into());
                     stat(ui, "Auditing active", &format!("Since {since}"));
-                    ui.add_space(8.0);
+                    ui.add_space(12.0);
                     // Stop control — disables auditing (and returns to the
                     // first-run view, handy for testing that state too)
                     if flat_button(ui, "Stop").clicked() {
                         app.stop_auditing(ctx);
                     }
+                    ui.add_space(12.0);
                 } else {
                     stat(ui, "Auditing is off", "No connection data has ever been collected");
                 }
