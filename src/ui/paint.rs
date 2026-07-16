@@ -201,7 +201,7 @@ fn titlebar(app: &mut App, ctx: &egui::Context) {
             p.galley(Pos2::new(name_pos.x, name_pos.y - name_galley.size().y / 2.0), name_galley.clone(), t::INK());
             let host = if app.ctx_info.hostname.is_empty() { String::new() } else { format!(" · {}", app.ctx_info.hostname) };
             // catchline sits just after the name (small fixed gap), not floated far right
-            p.text(Pos2::new(name_pos.x + name_galley.size().x + 12.0, rect.center().y), Align2::LEFT_CENTER, format!("— Windows Firewall Audit{host}"), t::sans(11.0), t::FAINT());
+            p.text(Pos2::new(name_pos.x + name_galley.size().x + 12.0, rect.center().y), Align2::LEFT_CENTER, format!("— Observe First. Enforce with Confidence.{host}"), t::sans(11.0), t::FAINT());
 
             // min / max / close — each a 46px hit target
             let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
