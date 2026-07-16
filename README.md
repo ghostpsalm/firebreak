@@ -11,6 +11,8 @@ It works by correlating Windows' own WFP audit events (Security log 5156
 allowed / 5157 blocked) against the live WFP filter table and
 `Get-NetFirewallRule`.
 
+![Firebreak rule-usage table](assets/screenshots/firebreak.png)
+
 ## Download
 
 Grab the latest `firebreak.exe` from the
