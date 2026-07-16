@@ -5,7 +5,7 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::listeners::{self, Listener};
 use crate::model::RuleUsage;
@@ -81,6 +81,177 @@ pub fn audit_enabled() -> Result<bool> {
 /// Security log. Manual counterpart to the automatic model-change reset.
 pub fn reset(db_path: &Path) -> Result<()> {
     Store::open(db_path)?.reset_ingestion()
+}
+
+/// Restore the audit policy + Security log size recorded before firebreak
+/// first changed them. Returns a human-readable summary.
+pub fn restore_audit_state(store: &Store) -> Result<String> {
+    let mut msg = String::new();
+    match (store.get_meta("prior_audit_success")?, store.get_meta("prior_audit_failure")?) {
+        (Some(s), Some(f)) => {
+            let state = audit_control::AuditState { success: s == "true", failure: f == "true" };
+            audit_control::set_auditing(state)?;
+            store.delete_meta("prior_audit_success")?;
+            store.delete_meta("prior_audit_failure")?;
+            msg = format!("Audit policy restored (success={}, failure={}).", state.success, state.failure);
+        }
+        _ => msg.push_str("No prior audit state recorded — nothing to restore."),
+    }
+    if let Some(bytes) = store.get_meta("prior_log_max_bytes")? {
+        if let Ok(bytes) = bytes.parse::<u64>() {
+            audit_control::set_security_log_max_bytes(bytes)?;
+            msg = format!("{msg} Security log size restored to {bytes} bytes.");
+        }
+        store.delete_meta("prior_log_max_bytes")?;
+    }
+    Ok(msg)
+}
+
+/// A file on the Desktop (falls back to the working dir) with a timestamped
+/// name and the given extension.
+fn desktop_file(stem: &str, ext: &str) -> PathBuf {
+    let stamp = Utc::now().format("%Y%m%dT%H%M%SZ");
+    let dir = std::env::var("USERPROFILE")
+        .map(|p| Path::new(&p).join("Desktop"))
+        .ok()
+        .filter(|d| d.exists())
+        .unwrap_or_else(|| PathBuf::from("."));
+    dir.join(format!("{stem}-{stamp}.{ext}"))
+}
+
+/// Export every rule row (as currently analyzed) to CSV for external
+/// filtering/reporting. Returns the written path.
+pub fn export_csv(rows: &[ui::RuleRow]) -> Result<PathBuf> {
+    let path = desktop_file("firebreak-usage", "csv");
+    let mut out = String::new();
+    out.push_str("Rule,DisplayName,Direction,Action,Profiles,Scope,Enabled,Allow,Block,Domain(A/B),Private(A/B),Public(A/B),LastSeen,DistinctPeers,AppsObserved,ListeningNow\n");
+    let cell = |s: &str| -> String {
+        if s.contains([',', '"', '\n']) {
+            format!("\"{}\"", s.replace('"', "\"\""))
+        } else {
+            s.to_string()
+        }
+    };
+    for r in rows {
+        let (allow, block) = r
+            .usage
+            .as_ref()
+            .map(|u| (u.allow_count, u.block_count))
+            .unwrap_or((0, 0));
+        let prof = |name: &str| -> String {
+            r.usage
+                .as_ref()
+                .and_then(|u| u.by_profile.iter().find(|(p, _, _)| p == name))
+                .map(|(_, a, b)| format!("{a}/{b}"))
+                .unwrap_or_else(|| "0/0".into())
+        };
+        let last = r.usage.as_ref().and_then(|u| u.last_seen.clone()).unwrap_or_default();
+        let peers = r.usage.as_ref().map(|u| u.distinct_peers).unwrap_or(0);
+        let line = [
+            cell(&r.rule.name),
+            cell(&r.rule.display_name),
+            cell(&r.rule.direction),
+            cell(&r.rule.action),
+            cell(&r.rule.profile),
+            cell(&listeners::scope_summary(&r.rule)),
+            cell(if r.rule.is_enabled() { "True" } else { "False" }),
+            allow.to_string(),
+            block.to_string(),
+            cell(&prof("Domain")),
+            cell(&prof("Private")),
+            cell(&prof("Public")),
+            cell(&last),
+            peers.to_string(),
+            cell(&r.seen_apps.join("; ")),
+            cell(&r.listening.join("; ")),
+        ]
+        .join(",");
+        out.push_str(&line);
+        out.push('\n');
+    }
+    std::fs::write(&path, out).with_context(|| format!("writing {}", path.display()))?;
+    Ok(path)
+}
+
+/// Analyze events from an exported .evtx file (e.g. from another device)
+/// against the current host's firewall rules. Writes into a throwaway DB so
+/// it never touches the live collection.
+pub fn import_evtx(evtx_path: &Path, progress: &dyn Fn(&str)) -> Result<AnalysisResult> {
+    progress("Loading firewall rules…");
+    let rules = firewall_rules::enumerate_rules()
+        .ok()
+        .or_else(firewall_rules::load_rules_cache)
+        .context("no firewall rules available to match against")?;
+
+    // scratch DB so import never disturbs the live usage store
+    let scratch = std::env::temp_dir().join(format!("firebreak-import-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&scratch);
+    let store = Store::open(&scratch)?;
+
+    let scope_index = crate::scope::ScopeIndex::build(&rules);
+    let iface_profiles = firewall_rules::interface_profile_map();
+    let device_map = app_identity::device_path_map();
+
+    store.begin()?;
+    let mut events_processed: u64 = 0;
+    let mut unmatched_events: u64 = 0;
+    let mut bucket_labels: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    progress("Reading events from file…");
+    let ingest = event_query::query_events_from_file(evtx_path, |ev| {
+        events_processed += 1;
+        let app = app_identity::normalize_path(&ev.application, &device_map);
+        let conn = crate::scope::Conn::from_event(&ev, &app, &iface_profiles);
+        let profile = conn.profile.label();
+        let matched = scope_index.matching_rules(&conn);
+        if matched.is_empty() {
+            unmatched_events += 1;
+            let origin = ev.filter_origin.as_deref().unwrap_or("Unknown").trim();
+            let origin = if origin.is_empty() { "Unknown" } else { origin };
+            let bucket = format!("default:{origin}");
+            bucket_labels.entry(bucket.clone()).or_insert_with(|| origin.to_string());
+            let _ = store.record_event(&bucket, &ev, &app, profile);
+        } else {
+            for rule_name in matched {
+                let _ = store.record_event(rule_name, &ev, &app, profile);
+            }
+        }
+    });
+    if let Err(e) = ingest {
+        let _ = store.rollback();
+        let _ = std::fs::remove_file(&scratch);
+        return Err(e).context("reading .evtx file");
+    }
+    for (id, label) in &bucket_labels {
+        let _ = store.set_bucket_label(id, label);
+    }
+    store.commit()?;
+
+    progress("Building report…");
+    let listener_list = Vec::new(); // listeners are local/live; N/A for an import
+    let all_usage = store.all_usage()?;
+    let rows = build_rows(rules, &all_usage, &listener_list);
+    let unmatched = build_unmatched(&store)?;
+    drop(store);
+    let _ = std::fs::remove_file(&scratch);
+
+    let name = evtx_path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    Ok(AnalysisResult {
+        rows,
+        ctx: ui::AuditContext {
+            hostname: format!("imported: {name}"),
+            auditing_active: true,
+            collection_started: None,
+            last_ingest: Some(now_iso()),
+            events_processed,
+            unmatched_events,
+            note: format!(
+                "Imported {events_processed} events from {name}, matched against THIS host's \
+                 rules. Live listeners don't apply to an import."
+            ),
+        },
+        unmatched,
+        listeners: listener_list,
+    })
 }
 
 /// First-run path: record prior audit config, enable auditing, size the

@@ -63,7 +63,7 @@ pub fn export(out_path: &Path) -> Result<()> {
     }
     // raw auditpol output, for cross-checking the API result
     let _ = writeln!(o, "\n[auditpol /get, verbose]");
-    match std::process::Command::new(crate::syspath::system32_tool("auditpol.exe"))
+    match crate::syspath::command(crate::syspath::system32_tool("auditpol.exe"))
         .args(["/get", &format!("/subcategory:{}", audit_control::FILTERING_PLATFORM_CONNECTION_GUID)])
         .output()
     {
@@ -230,7 +230,7 @@ fn truncate(s: &str, n: usize) -> String {
 }
 
 fn os_version() -> String {
-    std::process::Command::new(crate::syspath::system32_tool("cmd.exe"))
+    crate::syspath::command(crate::syspath::system32_tool("cmd.exe"))
         .args(["/c", "ver"])
         .output()
         .ok()

@@ -7,7 +7,6 @@
 //! subcategory names.
 
 use anyhow::{bail, Context, Result};
-use std::process::Command;
 
 #[cfg(windows)]
 use windows::core::GUID;
@@ -70,7 +69,7 @@ pub fn query_audit_state() -> Result<AuditState> {
 /// refresh — if this flips back off between runs, that's the place to look.
 pub fn set_auditing(state: AuditState) -> Result<()> {
     let onoff = |b: bool| if b { "enable" } else { "disable" };
-    let out = Command::new(crate::syspath::system32_tool("auditpol.exe"))
+    let out = crate::syspath::command(crate::syspath::system32_tool("auditpol.exe"))
         .args([
             "/set",
             &format!("/subcategory:{}", FILTERING_PLATFORM_CONNECTION_GUID),
@@ -98,7 +97,7 @@ pub fn enable_auditing() -> Result<()> {
 
 /// Current max size of the Security log in bytes, via wevtutil gl.
 pub fn security_log_max_bytes() -> Result<u64> {
-    let out = Command::new(crate::syspath::system32_tool("wevtutil.exe"))
+    let out = crate::syspath::command(crate::syspath::system32_tool("wevtutil.exe"))
         .args(["gl", "Security"])
         .output()
         .context("running wevtutil gl Security")?;
@@ -117,7 +116,7 @@ pub fn security_log_max_bytes() -> Result<u64> {
 
 /// Set the Security log max size (bytes).
 pub fn set_security_log_max_bytes(bytes: u64) -> Result<()> {
-    let out = Command::new(crate::syspath::system32_tool("wevtutil.exe"))
+    let out = crate::syspath::command(crate::syspath::system32_tool("wevtutil.exe"))
         .args(["sl", "Security", &format!("/ms:{}", bytes)])
         .output()
         .context("running wevtutil sl Security")?;

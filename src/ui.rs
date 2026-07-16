@@ -159,6 +159,12 @@ pub struct App {
     confirm_open: bool,
     apply: Option<ApplyState>,
     status: String,
+    /// user acknowledged the young-evidence warning band (dismisses it)
+    warning_acked: bool,
+    /// persisted drawer height across frames/toggles
+    drawer_height: f32,
+    settings_open: bool,
+    about_open: bool,
 }
 
 impl App {
@@ -189,6 +195,10 @@ impl App {
             confirm_open: false,
             apply: None,
             status: String::new(),
+            warning_acked: false,
+            drawer_height: 190.0,
+            settings_open: false,
+            about_open: false,
         }
     }
 
@@ -243,6 +253,31 @@ impl App {
                 };
                 let _ = tx.send(msg);
             }
+            egui_ctx.request_repaint();
+        });
+    }
+
+    /// Analyze events from an imported .evtx file on a worker thread.
+    fn spawn_import(&mut self, path: PathBuf, egui_ctx: egui::Context) {
+        self.phase = Phase::Loading;
+        self.audit_checked = true;
+        self.progress = "Importing events…".into();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.worker_rx = Some(rx);
+        std::thread::spawn(move || {
+            let progress = {
+                let tx = tx.clone();
+                let ctx = egui_ctx.clone();
+                move |s: &str| {
+                    let _ = tx.send(WorkerMsg::Progress(s.to_string()));
+                    ctx.request_repaint();
+                }
+            };
+            let msg = match pipeline::import_evtx(&path, &progress) {
+                Ok(r) => WorkerMsg::Ready(Box::new(r)),
+                Err(e) => WorkerMsg::Failed(format!("{e:#}")),
+            };
+            let _ = tx.send(msg);
             egui_ctx.request_repaint();
         });
     }

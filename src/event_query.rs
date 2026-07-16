@@ -49,21 +49,31 @@ mod win {
     }
 
     pub fn open_query(channel: &str, xpath: &str, forward: bool) -> Result<Handle> {
-        let channel = to_wide(channel);
+        open_query_flagged(channel, xpath, forward, EvtQueryChannelPath.0 as u32)
+    }
+
+    /// Open a query against a saved .evtx file rather than a live channel.
+    pub fn open_query_file(path: &str, xpath: &str) -> Result<Handle> {
+        use windows::Win32::System::EventLog::EvtQueryFilePath;
+        open_query_flagged(path, xpath, true, EvtQueryFilePath.0 as u32)
+    }
+
+    fn open_query_flagged(source: &str, xpath: &str, forward: bool, source_flag: u32) -> Result<Handle> {
+        let source = to_wide(source);
         let query = to_wide(xpath);
         let direction = if forward {
-            EvtQueryForwardDirection.0
+            EvtQueryForwardDirection.0 as u32
         } else {
-            EvtQueryReverseDirection.0
+            EvtQueryReverseDirection.0 as u32
         };
         unsafe {
             let h = EvtQuery(
                 None,
-                PCWSTR(channel.as_ptr()),
+                PCWSTR(source.as_ptr()),
                 PCWSTR(query.as_ptr()),
-                (EvtQueryChannelPath.0 | direction) as u32,
+                source_flag | direction,
             )
-            .context("EvtQuery failed (needs elevation / Event Log Readers)")?;
+            .context("EvtQuery failed (needs elevation / Event Log Readers, or a readable .evtx)")?;
             Ok(Handle(h))
         }
     }
@@ -148,6 +158,41 @@ pub fn query_events(
 #[cfg(not(windows))]
 pub fn query_events(
     _since_record_id: Option<u64>,
+    _on_event: impl FnMut(EventRecord),
+) -> Result<u64> {
+    bail!("event log query is only available on Windows")
+}
+
+/// Read all 5156/5157 events from a saved .evtx file (import path).
+#[cfg(windows)]
+pub fn query_events_from_file(
+    path: &std::path::Path,
+    mut on_event: impl FnMut(EventRecord),
+) -> Result<u64> {
+    let xpath = build_query(None);
+    let result_set = win::open_query_file(&path.to_string_lossy(), &xpath)?;
+    let mut total: u64 = 0;
+    let mut render_buf: Vec<u16> = Vec::new();
+    loop {
+        let mut handles = [0isize; 64];
+        let returned = win::next_batch(&result_set, &mut handles)?;
+        if returned == 0 {
+            return Ok(total);
+        }
+        for &raw in handles.iter().take(returned as usize) {
+            if let Some(xml) = win::render_xml(raw, &mut render_buf) {
+                if let Some(ev) = parse_event_xml(&xml) {
+                    total += 1;
+                    on_event(ev);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub fn query_events_from_file(
+    _path: &std::path::Path,
     _on_event: impl FnMut(EventRecord),
 ) -> Result<u64> {
     bail!("event log query is only available on Windows")

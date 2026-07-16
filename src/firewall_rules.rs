@@ -8,7 +8,6 @@ use anyhow::{bail, Context, Result};
 use base64::Engine;
 use chrono::Utc;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use crate::model::RuleInfo;
 
@@ -18,7 +17,7 @@ pub(crate) fn run_powershell(script: &str) -> Result<String> {
         .flat_map(|u| u.to_le_bytes())
         .collect();
     let encoded = base64::engine::general_purpose::STANDARD.encode(utf16);
-    let out = Command::new(crate::syspath::powershell())
+    let out = crate::syspath::command(crate::syspath::powershell())
         .args([
             "-NoProfile",
             "-NonInteractive",
@@ -157,7 +156,7 @@ pub fn backup_policy(rules: &[RuleInfo]) -> Result<PathBuf> {
     let wfw = dir.join(format!("firewall-{stamp}.wfw"));
     let json = dir.join(format!("rules-{stamp}.json"));
 
-    let out = Command::new(crate::syspath::system32_tool("netsh.exe"))
+    let out = crate::syspath::command(crate::syspath::system32_tool("netsh.exe"))
         .args(["advfirewall", "export", &wfw.to_string_lossy()])
         .output()
         .context("running netsh advfirewall export")?;

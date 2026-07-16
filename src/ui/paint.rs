@@ -63,6 +63,27 @@ mod glyph {
         tri_up(p, center, size, color);
     }
 
+    /// Warning sign: filled triangle with a white exclamation mark.
+    pub fn warn_sign(p: &egui::Painter, center: Pos2, size: f32, color: Color32) {
+        let s = size / 2.0;
+        p.add(egui::Shape::convex_polygon(
+            vec![
+                Pos2::new(center.x - s, center.y + s * 0.75),
+                Pos2::new(center.x + s, center.y + s * 0.75),
+                Pos2::new(center.x, center.y - s * 0.85),
+            ],
+            color,
+            Stroke::NONE,
+        ));
+        // exclamation: stem + dot in white
+        let top = center.y - s * 0.1;
+        p.line_segment(
+            [Pos2::new(center.x, top), Pos2::new(center.x, center.y + s * 0.25)],
+            Stroke::new((size * 0.11).max(1.2), Color32::WHITE),
+        );
+        p.circle_filled(Pos2::new(center.x, center.y + s * 0.5), (size * 0.075).max(0.9), Color32::WHITE);
+    }
+
     pub fn magnifier(p: &egui::Painter, center: Pos2, color: Color32) {
         let r = 4.0;
         let c = Pos2::new(center.x - 1.0, center.y - 1.0);
@@ -87,7 +108,9 @@ pub fn window(app: &mut App, ctx: &egui::Context) {
     titlebar(app, ctx);
     header(app, ctx);
     if let Some(hours) = app.young_evidence_hours() {
-        warning_band(app, ctx, hours);
+        if !app.warning_acked {
+            warning_band(app, ctx, hours);
+        }
     } else if !app.ctx_info.note.is_empty() {
         note_band(app, ctx);
     }
@@ -104,6 +127,7 @@ pub fn window(app: &mut App, ctx: &egui::Context) {
     if app.confirm_open {
         confirm_modal(app, ctx);
     }
+    about_box(app, ctx);
     // 1px window border on a foreground layer (we draw our own chrome)
     let screen = ctx.screen_rect();
     ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("winborder")))
@@ -219,12 +243,16 @@ fn header(app: &mut App, ctx: &egui::Context) {
                     stat(
                         ui,
                         if gap { "Coverage gap" } else { "Coverage complete" },
-                        if gap { "see warning above" } else { "no gaps detected in audit log" },
+                        if gap { "see warning below" } else { "no gaps detected in audit log" },
                     );
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    settings_button(ui);
+                    let settings = settings_button(ui);
+                    if settings.clicked() {
+                        app.settings_open = !app.settings_open;
+                    }
+                    settings_menu(app, ui, ctx, settings.rect);
                     if active {
                         ui.add_space(8.0);
                         if flat_button(ui, "Refresh now").clicked() {
@@ -271,6 +299,154 @@ fn flat_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
     resp
 }
 
+/// Dropdown anchored under the Settings button.
+fn settings_menu(app: &mut App, _ui: &mut egui::Ui, ctx: &egui::Context, anchor: Rect) {
+    if !app.settings_open {
+        return;
+    }
+    let area = egui::Area::new(egui::Id::new("settings_menu"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(Pos2::new(anchor.right() - 210.0, anchor.bottom() + 2.0));
+    let resp = area.show(ctx, |ui| {
+        egui::Frame::none()
+            .fill(Color32::WHITE)
+            .stroke(Stroke::new(1.0, t::CONTROL_BORDER))
+            .inner_margin(egui::Margin::same(4.0))
+            .show(ui, |ui| {
+                ui.set_width(202.0);
+                let ready = app.phase == Phase::Ready && app.db_path.is_some();
+                if menu_item(ui, "Export usage to CSV…", ready) {
+                    do_export_csv(app);
+                    app.settings_open = false;
+                }
+                if menu_item(ui, "Import events from .evtx…", app.db_path.is_some()) {
+                    app.settings_open = false;
+                    do_import_evtx(app, ctx);
+                }
+                if menu_item(ui, "Rescan entire log", ready) {
+                    if let Some(db) = app.db_path.clone() {
+                        let _ = crate::pipeline::reset(&db);
+                        app.phase = Phase::Loading;
+                        app.spawn_detect(db, ctx.clone());
+                    }
+                    app.settings_open = false;
+                }
+                if menu_item(ui, "Restore audit policy", app.db_path.is_some()) {
+                    if let Some(db) = app.db_path.clone() {
+                        if let Ok(store) = crate::store::Store::open(&db) {
+                            app.status = match crate::pipeline::restore_audit_state(&store) {
+                                Ok(m) => m,
+                                Err(e) => format!("Restore failed: {e:#}"),
+                            };
+                        }
+                    }
+                    app.settings_open = false;
+                }
+                ui.separator();
+                if menu_item(ui, "About firebreak", true) {
+                    app.about_open = true;
+                    app.settings_open = false;
+                }
+            });
+    });
+    // click-away closes
+    if resp.response.clicked_elsewhere() {
+        app.settings_open = false;
+    }
+}
+
+fn do_export_csv(app: &mut App) {
+    match crate::pipeline::export_csv(&app.rows) {
+        Ok(p) => app.status = format!("Exported {} rules → {}", app.rows.len(), p.display()),
+        Err(e) => app.status = format!("CSV export failed: {e:#}"),
+    }
+}
+
+#[cfg(windows)]
+fn do_import_evtx(app: &mut App, ctx: &egui::Context) {
+    if let Some(path) = rfd::FileDialog::new()
+        .add_filter("Windows event log", &["evtx"])
+        .set_title("Import a saved Security .evtx")
+        .pick_file()
+    {
+        app.spawn_import(path, ctx.clone());
+    }
+}
+
+#[cfg(not(windows))]
+fn do_import_evtx(app: &mut App, _ctx: &egui::Context) {
+    app.status = "Import is only available on Windows.".into();
+}
+
+fn menu_item(ui: &mut egui::Ui, label: &str, enabled: bool) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), if enabled { Sense::click() } else { Sense::hover() });
+    if enabled && resp.hovered() {
+        ui.painter().rect_filled(rect, 0.0, t::ACCENT_TINT);
+    }
+    let col = if enabled { t::INK } else { t::DISABLED };
+    ui.painter().text(Pos2::new(rect.left() + 8.0, rect.center().y), Align2::LEFT_CENTER, label, t::sans(12.0), col);
+    enabled && resp.clicked()
+}
+
+fn about_box(app: &mut App, ctx: &egui::Context) {
+    if !app.about_open {
+        return;
+    }
+    egui::Area::new(egui::Id::new("about_scrim")).order(egui::Order::Background).show(ctx, |ui| {
+        ui.painter().rect_filled(ctx.screen_rect(), 0.0, Color32::from_rgba_unmultiplied(44, 62, 80, 90));
+    });
+    let mut open = true;
+    egui::Window::new("about")
+        .title_bar(false)
+        .collapsible(false)
+        .resizable(false)
+        .fixed_size(Vec2::new(360.0, 0.0))
+        .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+        .frame(egui::Frame::none().fill(Color32::WHITE).stroke(Stroke::new(1.0, t::CONTROL_BORDER)))
+        .show(ctx, |ui| {
+            ui.add_space(18.0);
+            ui.horizontal(|ui| {
+                ui.add_space(20.0);
+                let (r, _) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::hover());
+                ui.painter().rect_filled(r, 0.0, t::LOGO_RED);
+                ui.add_space(4.0);
+                ui.vertical(|ui| {
+                    ui.label(egui::RichText::new("firebreak").font(t::semibold(15.0)).color(t::INK));
+                    ui.label(egui::RichText::new(format!("Version {}", env!("CARGO_PKG_VERSION"))).font(t::mono(11.0)).color(t::SECONDARY));
+                });
+            });
+            ui.add_space(12.0);
+            for line in [
+                "Windows Firewall rule-usage auditor.",
+                "Correlates WFP connection audit events (5156/5157)",
+                "with firewall rules to find unused and over-broad rules.",
+            ] {
+                ui.horizontal(|ui| {
+                    ui.add_space(20.0);
+                    ui.label(egui::RichText::new(line).font(t::sans(11.5)).color(t::SECONDARY));
+                });
+            }
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.add_space(20.0);
+                ui.label(egui::RichText::new(format!("Host: {}", app.ctx_info.hostname)).font(t::mono(11.0)).color(t::TERTIARY));
+            });
+            ui.add_space(14.0);
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(20.0);
+                    if primary_button(ui, "Close", t::ACCENT).clicked() {
+                        open = false;
+                    }
+                });
+            });
+            ui.add_space(16.0);
+        });
+    if !open {
+        app.about_open = false;
+    }
+}
+
 /// "Settings ▾" with a drawn caret.
 fn settings_button(ui: &mut egui::Ui) -> egui::Response {
     let galley = ui.painter().layout_no_wrap("Settings".to_string(), t::sans(12.0), t::INK);
@@ -285,13 +461,15 @@ fn settings_button(ui: &mut egui::Ui) -> egui::Response {
 
 // ---- warning band ----
 
-fn warning_band(app: &App, ctx: &egui::Context, hours: f64) {
+fn warning_band(app: &mut App, ctx: &egui::Context, hours: f64) {
     egui::TopBottomPanel::top("warning")
         .frame(egui::Frame::none().fill(t::ADVISORY_BG).inner_margin(egui::Margin::symmetric(PAGE, 8.0)))
         .show(ctx, |ui| {
             super::stroke_bottom(ui.painter(), ui.max_rect().expand2(Vec2::new(PAGE, 8.0)), t::ADVISORY_BORDER);
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("▲").font(t::sans(12.0)).color(t::ADVISORY));
+                // drawn warning triangle with an exclamation, not a text glyph
+                let (r, _) = ui.allocate_exact_size(Vec2::new(15.0, 15.0), Sense::hover());
+                glyph::warn_sign(ui.painter(), r.center(), 13.0, t::ADVISORY);
                 ui.add_space(6.0);
                 let human = if hours < 48.0 {
                     format!("Only {} hours of evidence.", hours.round() as i64)
@@ -302,19 +480,24 @@ fn warning_band(app: &App, ctx: &egui::Context, hours: f64) {
                 job.append(&human, 0.0, fmt(t::semibold(12.0), t::ADVISORY_TEXT));
                 job.append(
                     "  Zero-hit values are not yet meaningful — weekly and monthly traffic hasn't \
-                     had a chance to occur. Apply is limited to enabling rules until coverage matures.",
+                     had a chance to occur.",
                     0.0,
                     fmt(t::sans(12.0), t::ADVISORY_TEXT),
                 );
                 ui.label(job);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let _ = app;
-                    ui.label(
-                        egui::RichText::new("override")
-                            .font(t::sans(11.0))
-                            .color(t::ADVISORY_HEADER)
-                            .underline(),
+                    let ack = ui.add(
+                        egui::Label::new(
+                            egui::RichText::new("Acknowledge")
+                                .font(t::sans(11.0))
+                                .color(t::ADVISORY_HEADER)
+                                .underline(),
+                        )
+                        .sense(Sense::click()),
                     );
+                    if ack.clicked() {
+                        app.warning_acked = true;
+                    }
                 });
             });
         });
@@ -387,12 +570,13 @@ fn filter_bar(app: &mut App, ctx: &egui::Context) {
                 ui.set_height(CTRL_H);
                 ui.spacing_mut().item_spacing = Vec2::new(6.0, 0.0);
 
-                // search box (fixed height frame so it matches the segments)
+                // search box — text indented past the magnifier so the icon
+                // sits inside the field, not over the text
                 let search = egui::TextEdit::singleline(&mut app.filter_text)
-                    .hint_text("      Filter rules…")
+                    .hint_text("Filter rules…")
                     .desired_width(210.0)
                     .font(t::sans(12.0))
-                    .margin(egui::Margin { left: 8.0, right: 8.0, top: 4.0, bottom: 4.0 });
+                    .margin(egui::Margin { left: 26.0, right: 8.0, top: 4.0, bottom: 4.0 });
                 let resp = ui.add_sized(Vec2::new(224.0, CTRL_H), search);
                 glyph::magnifier(ui.painter(), Pos2::new(resp.rect.left() + 12.0, resp.rect.center().y), t::FAINT);
 
@@ -534,12 +718,13 @@ fn central(app: &mut App, ctx: &egui::Context) {
             }
             let full = ui.max_rect();
             let cols = Cols::compute(full.left(), full.width());
-            table_header(ui, app, &cols);
             let visible = app.visible();
             if visible.is_empty() {
+                table_header(ui, app, &cols);
                 empty_state(app, ui);
                 return;
             }
+            // rows first, in the area below the header…
             let row_area = Rect::from_min_max(
                 Pos2::new(full.left(), full.top() + HEADER_H),
                 full.max,
@@ -553,12 +738,14 @@ fn central(app: &mut App, ctx: &egui::Context) {
                     for vi in range {
                         let ri = visible[vi];
                         let (rect, resp) = ui.allocate_exact_size(Vec2::new(cols.listen.0 + cols.listen.1 - full.left(), ROW_H), Sense::click());
-                        // recompute cols relative to this row rect's left
                         let rc = Cols::compute(rect.left(), rect.width());
                         row(app, ui, ri, rect, &rc, resp);
                     }
                 },
             );
+            // …then the header on top, so its bottom rule is always visible
+            // even when rows scroll up under it
+            table_header(ui, app, &cols);
         });
 }
 
@@ -1097,14 +1284,19 @@ fn drawer(app: &mut App, ctx: &egui::Context) {
     }
     let mut panel = egui::TopBottomPanel::bottom("drawer")
         .frame(egui::Frame::none().fill(t::RAISED));
-    // resizable only while open, with a comfortable default that shows the
-    // tab body; collapsed = just the 27px tab bar
+    // resizable only while open; height persists across frames/toggles via
+    // app.drawer_height (egui's own panel-size memory is reset by the
+    // open/close height override, so we track it ourselves)
     if app.drawer_open {
-        panel = panel.resizable(true).default_height(190.0).min_height(90.0).max_height(460.0);
+        let h = app.drawer_height.clamp(90.0, 520.0);
+        panel = panel
+            .resizable(true)
+            .default_height(h)
+            .height_range(90.0..=520.0);
     } else {
         panel = panel.resizable(false).exact_height(28.0);
     }
-    panel.show(ctx, |ui| {
+    let inner = panel.show(ctx, |ui| {
             // tab bar
             let bar = ui.allocate_exact_size(Vec2::new(ui.available_width(), 27.0), Sense::hover()).0;
             ui.painter().hline(bar.x_range(), bar.bottom() - 0.5, Stroke::new(1.0, t::BORDER_LIGHT));
@@ -1153,6 +1345,10 @@ fn drawer(app: &mut App, ctx: &egui::Context) {
                 });
             }
         });
+    // remember the (possibly dragged) height so it persists across frames
+    if app.drawer_open {
+        app.drawer_height = inner.response.rect.height();
+    }
 }
 
 fn sockets_body(app: &App, ui: &mut egui::Ui) {

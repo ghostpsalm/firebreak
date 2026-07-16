@@ -169,37 +169,9 @@ fn main() -> Result<()> {
 }
 
 /// Put the host's audit configuration back to what was recorded before
-/// firebreak first changed it (S-06): audit subcategory state and Security
-/// log size. Collected usage data is left untouched.
+/// firebreak first changed it (S-06). Collected usage data is left untouched.
 fn restore_audit(store: &Store) -> Result<()> {
-    let success = store.get_meta("prior_audit_success")?;
-    let failure = store.get_meta("prior_audit_failure")?;
-    match (success, failure) {
-        (Some(s), Some(f)) => {
-            let state = audit_control::AuditState {
-                success: s == "true",
-                failure: f == "true",
-            };
-            audit_control::set_auditing(state)?;
-            println!(
-                "Audit policy restored (success={}, failure={}).",
-                state.success, state.failure
-            );
-            store.delete_meta("prior_audit_success")?;
-            store.delete_meta("prior_audit_failure")?;
-        }
-        _ => println!(
-            "No prior audit state recorded — firebreak never changed the audit policy \
-             on this host (or it was already restored). Leaving it as is."
-        ),
-    }
-    if let Some(bytes) = store.get_meta("prior_log_max_bytes")? {
-        if let Ok(bytes) = bytes.parse::<u64>() {
-            audit_control::set_security_log_max_bytes(bytes)?;
-            println!("Security log max size restored to {} bytes.", bytes);
-        }
-        store.delete_meta("prior_log_max_bytes")?;
-    }
+    println!("{}", pipeline::restore_audit_state(store)?);
     Ok(())
 }
 
