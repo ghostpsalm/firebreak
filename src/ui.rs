@@ -237,6 +237,7 @@ pub struct App {
     drawer_height: f32,
     settings_open: bool,
     about_open: bool,
+    pub(crate) dark_mode: bool,
     /// lazily-loaded app logo for the title bar
     pub(crate) logo: Option<egui::TextureHandle>,
     /// scratch DB for the current .evtx import session (persists across
@@ -277,6 +278,7 @@ impl App {
             drawer_height: 190.0,
             settings_open: false,
             about_open: false,
+            dark_mode: false,
             logo: None,
             import_db: None,
         }
@@ -859,10 +861,10 @@ pub fn run_preview(
 // small helpers shared with the paint module
 pub(crate) fn profile_chip(tag: &str) -> (&'static str, Color32, Color32, Color32) {
     match tag {
-        "Domain" => t::CHIP_DOM,
-        "Private" => t::CHIP_PRV,
-        "Public" => t::CHIP_PUB,
-        _ => t::CHIP_ANY,
+        "Domain" => t::CHIP_DOM(),
+        "Private" => t::CHIP_PRV(),
+        "Public" => t::CHIP_PUB(),
+        _ => t::CHIP_ANY(),
     }
 }
 
@@ -928,7 +930,7 @@ mod helpers {
         let (fg, bg, border) = if kept {
             (fg, bg, border)
         } else {
-            (t::DISABLED, egui::Color32::from_rgb(0xF2, 0xF3, 0xF5), t::HAIRLINE_TEXT)
+            (t::DISABLED(), egui::Color32::from_rgb(0xF2, 0xF3, 0xF5), t::HAIRLINE_TEXT())
         };
         let galley = ui.painter().layout_no_wrap(short.to_string(), font.clone(), fg);
         let w = galley.size().x + 10.0;
@@ -938,13 +940,13 @@ mod helpers {
         ui.painter().galley(egui::pos2(r.left() + 5.0, r.center().y - galley.size().y / 2.0), galley, fg);
         if !kept {
             // strike-through
-            ui.painter().hline(r.left() + 3.0..=r.right() - 3.0, r.center().y, Stroke::new(1.0, t::DISABLED));
+            ui.painter().hline(r.left() + 3.0..=r.right() - 3.0, r.center().y, Stroke::new(1.0, t::DISABLED()));
         }
         let resp = if editable {
             let re = ui.interact(r, ui.id().with(("prof", id_src.0, id_src.1)), egui::Sense::click());
             if re.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                ui.painter().rect_stroke(r, 0.0, Stroke::new(1.0, t::ACCENT));
+                ui.painter().rect_stroke(r, 0.0, Stroke::new(1.0, t::ACCENT()));
             }
             Some(re)
         } else {
