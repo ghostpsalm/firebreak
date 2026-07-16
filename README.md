@@ -1,4 +1,7 @@
-# firebreak — Windows Firewall rule-usage auditor
+# Firebreak
+
+**Observe first. Enforce with confidence.**
+Turn real network activity into least-privilege firewall policy.
 
 On-demand tool (no service, no driver) that answers: **which firewall rules
 are actually being matched, by which applications, and how often** — so
@@ -7,9 +10,7 @@ unused rules can be disabled and used-but-broad rules can be security-vetted.
 It works by correlating Windows' own WFP audit events (Security log 5156
 allowed / 5157 blocked, which carry the application path and the WFP Filter
 Run-Time ID) against the live WFP filter table and `Get-NetFirewallRule`.
-See `ARCHITECTURE.md` for the full design and rationale, and
-`CODE_REVIEW_2026-07-15.md` for the review this codebase was hardened
-against.
+See `ARCHITECTURE.md` for the full design and rationale.
 
 ## Build
 
