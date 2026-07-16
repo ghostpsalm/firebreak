@@ -151,10 +151,13 @@ pub(crate) enum DirFilter {
     All,
 }
 
-/// User-adjustable widths for the fixed table columns (Rule and Apps stay
-/// flexible). Dragging a header divider updates these.
+/// User-adjustable widths for the table columns. `name` == 0 means auto
+/// (Rule shares the flex with Apps); once the user drags the Rule divider it
+/// becomes a fixed width and Apps alone takes the remaining flex. Dragging a
+/// header divider updates these.
 #[derive(Clone, Copy)]
 pub(crate) struct ColWidths {
+    pub name: f32,
     pub dir: f32,
     pub action: f32,
     pub profiles: f32,
@@ -166,7 +169,7 @@ pub(crate) struct ColWidths {
 
 impl Default for ColWidths {
     fn default() -> Self {
-        ColWidths { dir: 44.0, action: 54.0, profiles: 118.0, scope: 150.0, hits: 100.0, last: 78.0, listen: 132.0 }
+        ColWidths { name: 0.0, dir: 44.0, action: 54.0, profiles: 118.0, scope: 150.0, hits: 100.0, last: 78.0, listen: 132.0 }
     }
 }
 

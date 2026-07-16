@@ -826,10 +826,17 @@ struct Cols {
 
 impl Cols {
     fn compute(left: f32, width: f32, cw: &super::ColWidths) -> Cols {
-        let fixed = 34.0 + cw.dir + cw.action + cw.profiles + cw.scope + cw.hits + cw.last + cw.listen;
-        let flex = (width - fixed).max(300.0);
-        let name_w = (flex * (1.35 / 2.35)).max(190.0);
-        let apps_w = (flex - name_w).max(100.0);
+        let fixed_others = 34.0 + cw.dir + cw.action + cw.profiles + cw.scope + cw.hits + cw.last + cw.listen;
+        let (name_w, apps_w) = if cw.name > 0.0 {
+            // Rule pinned to a set width; Apps takes the remaining flex
+            let name_w = cw.name.clamp(120.0, width - fixed_others - 100.0);
+            (name_w, (width - fixed_others - name_w).max(100.0))
+        } else {
+            // auto: Rule and Apps share the flex
+            let flex = (width - fixed_others).max(300.0);
+            let name_w = (flex * (1.35 / 2.35)).max(190.0);
+            (name_w, (flex - name_w).max(100.0))
+        };
         let mut x = left;
         let mut col = |w: f32| {
             let a = x;
@@ -899,21 +906,25 @@ fn central(app: &mut App, ctx: &egui::Context) {
         });
 }
 
-/// Column boundaries that carry a draggable resize handle, paired with a
-/// mutable-width selector into ColWidths. The right edge of each fixed
-/// column is a handle that grows/shrinks that column.
+/// Column boundaries that carry a draggable resize handle. Each entry is
+/// (boundary_x, width selector, drag sign). Most boundaries resize the
+/// column to their left (sign +1). The Apps|Listening boundary resizes
+/// Listening (to its right) so it grows when dragged left (sign −1).
 fn resize_handles(app: &mut App, ui: &mut egui::Ui, cols: &Cols, header_rect: Rect) {
-    // (right_edge_x, which width to adjust)
-    let edges: [(f32, fn(&mut super::ColWidths) -> &mut f32); 7] = [
-        (cols.dir.0 + cols.dir.1, |c| &mut c.dir),
-        (cols.action.0 + cols.action.1, |c| &mut c.action),
-        (cols.profiles.0 + cols.profiles.1, |c| &mut c.profiles),
-        (cols.scope.0 + cols.scope.1, |c| &mut c.scope),
-        (cols.hits.0 + cols.hits.1, |c| &mut c.hits),
-        (cols.last.0 + cols.last.1, |c| &mut c.last),
-        (cols.listen.0 + cols.listen.1, |c| &mut c.listen),
+    // Rule width is "auto" (0) until first dragged — seed it with the
+    // current computed width so the drag starts from the right place.
+    let name_seed = cols.name.1;
+    let edges: [(f32, fn(&mut super::ColWidths) -> &mut f32, f32); 8] = [
+        (cols.name.0 + cols.name.1, |c| &mut c.name, 1.0), // Rule
+        (cols.dir.0 + cols.dir.1, |c| &mut c.dir, 1.0),
+        (cols.action.0 + cols.action.1, |c| &mut c.action, 1.0),
+        (cols.profiles.0 + cols.profiles.1, |c| &mut c.profiles, 1.0),
+        (cols.scope.0 + cols.scope.1, |c| &mut c.scope, 1.0),
+        (cols.hits.0 + cols.hits.1, |c| &mut c.hits, 1.0),
+        (cols.last.0 + cols.last.1, |c| &mut c.last, 1.0),
+        (cols.listen.0, |c| &mut c.listen, -1.0), // Listening (left edge)
     ];
-    for (i, (x, sel)) in edges.into_iter().enumerate() {
+    for (i, (x, sel, sign)) in edges.into_iter().enumerate() {
         let hit = Rect::from_min_max(Pos2::new(x - 3.0, header_rect.top()), Pos2::new(x + 3.0, header_rect.bottom()));
         let resp = ui.interact(hit, ui.id().with(("colresize", i)), Sense::drag());
         if resp.hovered() || resp.dragged() {
@@ -921,8 +932,12 @@ fn resize_handles(app: &mut App, ui: &mut egui::Ui, cols: &Cols, header_rect: Re
             ui.painter().vline(x, header_rect.y_range(), Stroke::new(1.0, t::ACCENT));
         }
         if resp.dragged() {
+            // seed Rule's width the first time it's dragged
+            if i == 0 && app.col_w.name == 0.0 {
+                app.col_w.name = name_seed;
+            }
             let w = sel(&mut app.col_w);
-            *w = (*w + resp.drag_delta().x).clamp(30.0, 400.0);
+            *w = (*w + sign * resp.drag_delta().x).clamp(60.0, 500.0);
         }
     }
 }
