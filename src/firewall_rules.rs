@@ -182,6 +182,34 @@ pub fn set_rule_enabled(rule_name: &str, enabled: bool) -> Result<()> {
     set_rules_enabled(std::slice::from_ref(&rule_name.to_string()), enabled)
 }
 
+/// Narrow (or widen) a rule's profile scope, e.g. `-Profile Domain,Private`
+/// to turn it off for Public. The rule is left enabled (you keep it active
+/// on the remaining profiles). `profile_arg` is a comma-separated set or
+/// "Any". Backup first — the UI's Apply flow does.
+pub fn set_rule_profiles(rule_name: &str, profile_arg: &str) -> Result<()> {
+    let name = rule_name.replace('\'', "''");
+    // profile_arg is a controlled token set (Any / Domain,Private,Public
+    // combinations from ProfileSet), passed unquoted so PowerShell coerces
+    // it to the Profile flags enum. Reject anything unexpected defensively.
+    let prof: String = profile_arg
+        .split(',')
+        .map(str::trim)
+        .filter(|p| matches!(*p, "Any" | "Domain" | "Private" | "Public"))
+        .collect::<Vec<_>>()
+        .join(",");
+    if prof.is_empty() {
+        bail!("no valid profiles in '{profile_arg}'");
+    }
+    let script = format!(
+        r#"
+$ErrorActionPreference = 'Stop'
+Set-NetFirewallRule -Name '{name}' -Profile {prof} -Enabled True
+"#
+    );
+    run_powershell(&script)?;
+    Ok(())
+}
+
 /// Enable/disable rules by unique Name (InstanceID). Backup first — this
 /// module doesn't do it for you; the UI's Apply flow does. On error,
 /// reports how many rules had already been applied.

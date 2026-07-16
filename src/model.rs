@@ -159,6 +159,54 @@ pub struct BaselineFlag {
     pub advice: &'static str,
 }
 
+/// The set of network profiles a rule applies to — the editable scope behind
+/// the clickable profile chips. "Any" expands to all three.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProfileSet {
+    pub domain: bool,
+    pub private: bool,
+    pub public: bool,
+}
+
+impl ProfileSet {
+    pub fn from_rule(r: &RuleInfo) -> ProfileSet {
+        let tags = r.profile_tags();
+        if tags == ["Any"] {
+            ProfileSet { domain: true, private: true, public: true }
+        } else {
+            ProfileSet {
+                domain: tags.contains(&"Domain"),
+                private: tags.contains(&"Private"),
+                public: tags.contains(&"Public"),
+            }
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        !self.domain && !self.private && !self.public
+    }
+
+    pub fn is_all(&self) -> bool {
+        self.domain && self.private && self.public
+    }
+
+    /// The `-Profile` argument for Set-NetFirewallRule; None when empty
+    /// (caller should disable the rule instead).
+    pub fn to_profile_arg(&self) -> Option<String> {
+        if self.is_empty() {
+            return None;
+        }
+        if self.is_all() {
+            return Some("Any".into());
+        }
+        let mut v = Vec::new();
+        if self.domain { v.push("Domain"); }
+        if self.private { v.push("Private"); }
+        if self.public { v.push("Public"); }
+        Some(v.join(","))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -337,7 +337,8 @@ fn build_rows(
                 .unwrap_or_default();
             let listening = listeners::listeners_for_rule(&rule, listener_list);
             let target_enabled = rule.is_enabled();
-            ui::RuleRow { rule, usage, flags, seen_apps, listening, target_enabled }
+            let target_profiles = crate::model::ProfileSet::from_rule(&rule);
+            ui::RuleRow { rule, usage, flags, seen_apps, listening, target_enabled, target_profiles }
         })
         .collect()
 }

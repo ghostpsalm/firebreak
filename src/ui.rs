@@ -25,6 +25,8 @@ pub struct RuleRow {
     pub seen_apps: Vec<String>,
     pub listening: Vec<String>,
     pub target_enabled: bool,
+    /// intended profile scope (edited via the profile chips)
+    pub target_profiles: crate::model::ProfileSet,
 }
 
 impl RuleRow {
@@ -34,8 +36,11 @@ impl RuleRow {
     fn is_zero_hit(&self) -> bool {
         self.total_hits() == 0
     }
+    fn orig_profiles(&self) -> crate::model::ProfileSet {
+        crate::model::ProfileSet::from_rule(&self.rule)
+    }
     fn pending(&self) -> bool {
-        self.target_enabled != self.rule.is_enabled()
+        self.target_enabled != self.rule.is_enabled() || self.target_profiles != self.orig_profiles()
     }
 }
 
@@ -78,13 +83,43 @@ enum WorkerMsg {
     Failed(String),
 }
 
+/// One planned firewall change, ready to apply and describe.
+#[derive(Clone)]
+pub(crate) struct PlannedChange {
+    pub name: String,
+    pub display: String,
+    pub kind: ChangeKind,
+}
+
+#[derive(Clone)]
+pub(crate) enum ChangeKind {
+    Disable,
+    Enable,
+    /// narrow the rule's profile scope; still enabled afterward
+    Profiles { arg: String, was_enabled: bool, removed: String },
+}
+
+impl PlannedChange {
+    fn new(r: &RuleRow, kind: ChangeKind) -> PlannedChange {
+        PlannedChange { name: r.rule.name.clone(), display: r.rule.display_name.clone(), kind }
+    }
+}
+
+fn removed_labels(orig: crate::model::ProfileSet, target: crate::model::ProfileSet) -> String {
+    let mut removed = Vec::new();
+    if orig.domain && !target.domain { removed.push("Domain"); }
+    if orig.private && !target.private { removed.push("Private"); }
+    if orig.public && !target.public { removed.push("Public"); }
+    removed.join(", ")
+}
+
 /// Streamed apply progress — one message per step so the footer shows
 /// "2 of 3" and rows show per-rule status/failures.
 enum ApplyMsg {
     BackupOk(String),
     BackupFailed(String),
     RuleStart { name: String },
-    RuleDone { name: String, target_enabled: bool, error: Option<String> },
+    RuleDone { name: String, error: Option<String> },
     Finished,
 }
 
@@ -123,8 +158,8 @@ struct ApplyState {
     current: Option<String>,
     backup: Option<String>,
     backup_failed: Option<String>,
-    /// per-rule outcome: name -> Ok(target) | Err(msg)
-    results: std::collections::HashMap<String, Result<bool, String>>,
+    /// per-rule outcome: name -> Ok(()) | Err(msg)
+    results: std::collections::HashMap<String, Result<(), String>>,
     finished: bool,
     stop_requested: bool,
 }
@@ -309,6 +344,15 @@ impl App {
             }
             Ok("modal") => app.confirm_open = true,
             Ok("selected") => app.selected = Some(0),
+            Ok("profiles") => {
+                // demo: remove Public from a multi-profile rule + a disable
+                for r in app.rows.iter_mut() {
+                    if r.rule.display_name.contains("File and Printer") {
+                        r.target_profiles.public = false;
+                    }
+                }
+                app.confirm_open = true;
+            }
             _ => {}
         }
         app
@@ -412,17 +456,42 @@ impl App {
 
     // ---- pending / apply ----
 
-    fn pending(&self) -> (Vec<String>, Vec<String>) {
-        let mut dis = Vec::new();
-        let mut en = Vec::new();
+    /// All pending changes as a concrete apply plan.
+    fn planned_changes(&self) -> Vec<PlannedChange> {
+        let mut out = Vec::new();
         for r in &self.rows {
-            if r.rule.is_enabled() && !r.target_enabled {
-                dis.push(r.rule.name.clone());
-            } else if !r.rule.is_enabled() && r.target_enabled {
-                en.push(r.rule.name.clone());
+            let orig = r.orig_profiles();
+            let was_enabled = r.rule.is_enabled();
+            // whole-rule off wins over any profile edit
+            if !r.target_enabled || r.target_profiles.is_empty() {
+                if was_enabled {
+                    out.push(PlannedChange::new(r, ChangeKind::Disable));
+                }
+                continue;
+            }
+            // enabled target
+            if r.target_profiles != orig {
+                let arg = r.target_profiles.to_profile_arg().unwrap_or_else(|| "Any".into());
+                out.push(PlannedChange::new(r, ChangeKind::Profiles { arg, was_enabled, removed: removed_labels(orig, r.target_profiles) }));
+            } else if !was_enabled {
+                out.push(PlannedChange::new(r, ChangeKind::Enable));
             }
         }
-        (dis, en)
+        out
+    }
+
+    fn pending_counts(&self) -> (usize, usize, usize) {
+        let mut dis = 0;
+        let mut en = 0;
+        let mut scope = 0;
+        for c in self.planned_changes() {
+            match c.kind {
+                ChangeKind::Disable => dis += 1,
+                ChangeKind::Enable => en += 1,
+                ChangeKind::Profiles { .. } => scope += 1,
+            }
+        }
+        (dis, en, scope)
     }
 
     /// Coverage/evidence-age assessment → warning band. Some(hours) when
@@ -443,15 +512,16 @@ impl App {
     fn revert_all(&mut self) {
         for r in &mut self.rows {
             r.target_enabled = r.rule.is_enabled();
+            r.target_profiles = crate::model::ProfileSet::from_rule(&r.rule);
         }
     }
 
     fn start_apply(&mut self, egui_ctx: &egui::Context) {
-        let (dis, en) = self.pending();
-        let total = dis.len() + en.len();
-        if total == 0 {
+        let plan = self.planned_changes();
+        if plan.is_empty() {
             return;
         }
+        let total = plan.len();
         let all_rules: Vec<RuleInfo> = self.rows.iter().map(|r| r.rule.clone()).collect();
         let (tx, rx) = std::sync::mpsc::channel();
         self.apply = Some(ApplyState {
@@ -478,21 +548,19 @@ impl App {
                     return;
                 }
             }
-            // disables first (design lists disables above enables)
-            for (name, target) in dis
-                .into_iter()
-                .map(|n| (n, false))
-                .chain(en.into_iter().map(|n| (n, true)))
-            {
-                let _ = tx.send(ApplyMsg::RuleStart { name: name.clone() });
+            for change in plan {
+                let _ = tx.send(ApplyMsg::RuleStart { name: change.name.clone() });
                 egui_ctx.request_repaint();
-                let error = firewall_rules::set_rule_enabled(&name, target)
-                    .err()
-                    .map(|e| format!("{e:#}"));
+                let result = match &change.kind {
+                    ChangeKind::Disable => firewall_rules::set_rule_enabled(&change.name, false),
+                    ChangeKind::Enable => firewall_rules::set_rule_enabled(&change.name, true),
+                    ChangeKind::Profiles { arg, .. } => {
+                        firewall_rules::set_rule_profiles(&change.name, arg)
+                    }
+                };
                 let _ = tx.send(ApplyMsg::RuleDone {
-                    name,
-                    target_enabled: target,
-                    error,
+                    name: change.name,
+                    error: result.err().map(|e| format!("{e:#}")),
                 });
                 egui_ctx.request_repaint();
             }
@@ -503,19 +571,19 @@ impl App {
 
     fn poll_apply(&mut self, ctx: &egui::Context) {
         let Some(apply) = &mut self.apply else { return };
-        let mut newly_committed: Vec<(String, bool)> = Vec::new();
+        let mut newly_committed: Vec<String> = Vec::new();
         loop {
             match apply.rx.try_recv() {
                 Ok(ApplyMsg::BackupOk(p)) => apply.backup = Some(p),
                 Ok(ApplyMsg::BackupFailed(e)) => apply.backup_failed = Some(e),
                 Ok(ApplyMsg::RuleStart { name }) => apply.current = Some(name),
-                Ok(ApplyMsg::RuleDone { name, target_enabled, error }) => {
+                Ok(ApplyMsg::RuleDone { name, error }) => {
                     apply.done += 1;
                     apply.current = None;
                     match error {
                         None => {
-                            apply.results.insert(name.clone(), Ok(target_enabled));
-                            newly_committed.push((name, target_enabled));
+                            apply.results.insert(name.clone(), Ok(()));
+                            newly_committed.push(name);
                         }
                         Some(e) => {
                             apply.results.insert(name, Err(e));
@@ -530,11 +598,19 @@ impl App {
                 }
             }
         }
-        // commit saved state for succeeded rules so their checkboxes settle
-        for (name, target) in newly_committed {
+        // commit saved state for succeeded rules so their controls settle to
+        // the applied reality (enabled state + profile scope)
+        for name in newly_committed {
             if let Some(r) = self.rows.iter_mut().find(|r| r.rule.name == name) {
-                r.rule.enabled = if target { "True" } else { "False" }.into();
-                r.target_enabled = target;
+                let effective_enabled = r.target_enabled && !r.target_profiles.is_empty();
+                r.rule.enabled = if effective_enabled { "True" } else { "False" }.into();
+                r.target_enabled = effective_enabled;
+                if effective_enabled {
+                    r.rule.profile = r
+                        .target_profiles
+                        .to_profile_arg()
+                        .unwrap_or_else(|| "Any".into());
+                }
             }
         }
         if !apply.finished {
@@ -717,5 +793,52 @@ mod helpers {
         painter.rect(r, 0.0, bg, Stroke::new(1.0, border));
         painter.galley(egui::pos2(r.left() + 5.0, r.center().y - galley.size().y / 2.0), galley, fg);
         w + 3.0
+    }
+
+    /// Clickable profile chip. `kept` = still in the rule's target scope;
+    /// when false the chip is faded and struck through (pending removal).
+    /// Returns (width, click response if editable).
+    pub fn interactive_chip(
+        ui: &mut egui::Ui,
+        top_left: egui::Pos2,
+        tag: &str,
+        kept: bool,
+        editable: bool,
+        id_src: (usize, u8),
+    ) -> (f32, Option<egui::Response>) {
+        let (label, fg, bg, border) = profile_chip(match tag {
+            "Domain" => "Domain",
+            "Private" => "Private",
+            "Public" => "Public",
+            _ => "Any",
+        });
+        let short = &label; // DOM/PRV/PUB from profile_chip
+        let font = t::semibold(9.5);
+        let (fg, bg, border) = if kept {
+            (fg, bg, border)
+        } else {
+            (t::DISABLED, egui::Color32::from_rgb(0xF2, 0xF3, 0xF5), t::HAIRLINE_TEXT)
+        };
+        let galley = ui.painter().layout_no_wrap(short.to_string(), font.clone(), fg);
+        let w = galley.size().x + 10.0;
+        let h = 15.0;
+        let r = Rect::from_min_size(top_left, Vec2::new(w, h));
+        ui.painter().rect(r, 0.0, bg, Stroke::new(1.0, border));
+        ui.painter().galley(egui::pos2(r.left() + 5.0, r.center().y - galley.size().y / 2.0), galley, fg);
+        if !kept {
+            // strike-through
+            ui.painter().hline(r.left() + 3.0..=r.right() - 3.0, r.center().y, Stroke::new(1.0, t::DISABLED));
+        }
+        let resp = if editable {
+            let re = ui.interact(r, ui.id().with(("prof", id_src.0, id_src.1)), egui::Sense::click());
+            if re.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                ui.painter().rect_stroke(r, 0.0, Stroke::new(1.0, t::ACCENT));
+            }
+            Some(re)
+        } else {
+            None
+        };
+        (w + 3.0, resp)
     }
 }

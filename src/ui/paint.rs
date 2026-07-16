@@ -3,7 +3,7 @@
 //! table is custom-painted for exact grid, checkbox-intent, chip, and
 //! accent-edge fidelity.
 
-use super::{cell_text, chip, App, DirFilter, Phase, Sort, Tab};
+use super::{cell_text, interactive_chip, App, ChangeKind, DirFilter, Phase, PlannedChange, Sort, Tab};
 use crate::listeners::{self, Listener};
 use crate::theme::{self as t};
 use crate::time_util;
@@ -842,7 +842,7 @@ fn row(app: &mut App, ui: &mut egui::Ui, ri: usize, rect: Rect, cols: &Cols, res
             return None;
         }
         Some(match a.results.get(&r.rule.name) {
-            Some(Ok(target)) => RowApply::Done(*target),
+            Some(Ok(())) => RowApply::Done,
             Some(Err(e)) => RowApply::Failed(e.clone()),
             None if a.current.as_deref() == Some(r.rule.name.as_str()) => RowApply::Active(r.target_enabled),
             None if !a.finished => RowApply::Queued,
@@ -904,10 +904,25 @@ fn row(app: &mut App, ui: &mut egui::Ui, ri: usize, rect: Rect, cols: &Cols, res
     let act_col = if dimmed { t::DISABLED } else if r.rule.action.eq_ignore_ascii_case("block") { t::BLOCK } else { t::INK };
     cell_text(ui.painter(), col_rect(cols.action, rect), act_short(&r.rule.action), t::sans(12.0), act_col, 0.0);
 
-    // profiles chips
+    // profiles chips — clickable to toggle a profile off/on for this rule
+    let orig = r.orig_profiles();
+    let target = r.target_profiles;
+    let mut clicked_profile: Option<u8> = None;
     let mut cx = cols.profiles.0;
-    for tag in r.rule.profile_tags() {
-        cx += chip(ui.painter(), Pos2::new(cx, rect.center().y - 7.5), tag);
+    let editable = app.apply.is_none() && app.phase == Phase::Ready;
+    for (bit, present, kept, label) in [
+        (0u8, orig.domain, target.domain, "Domain"),
+        (1, orig.private, target.private, "Private"),
+        (2, orig.public, target.public, "Public"),
+    ] {
+        if !present {
+            continue;
+        }
+        let (w, resp) = interactive_chip(ui, Pos2::new(cx, rect.center().y - 7.5), label, kept, editable, (ri, bit));
+        cx += w;
+        if resp.map_or(false, |r| r.clicked()) {
+            clicked_profile = Some(bit);
+        }
     }
 
     // scope (mono)
@@ -973,7 +988,14 @@ fn row(app: &mut App, ui: &mut egui::Ui, ri: usize, rect: Rect, cols: &Cols, res
     );
 
     // interactions
-    if cb_resp.clicked() && app.apply.is_none() {
+    if let Some(bit) = clicked_profile {
+        let p = &mut app.rows[ri].target_profiles;
+        match bit {
+            0 => p.domain = !p.domain,
+            1 => p.private = !p.private,
+            _ => p.public = !p.public,
+        }
+    } else if cb_resp.clicked() && app.apply.is_none() {
         app.rows[ri].target_enabled = !app.rows[ri].target_enabled;
     } else if resp.clicked() {
         app.selected = if selected { None } else { Some(ri) };
@@ -987,7 +1009,7 @@ enum RowApply {
     Queued,
     Pending,
     Active(bool),
-    Done(bool),
+    Done,
     Failed(String),
 }
 
@@ -996,8 +1018,8 @@ impl RowApply {
         match self {
             RowApply::Queued => ("queued".into(), t::TERTIARY),
             RowApply::Pending => ("pending".into(), t::TERTIARY),
-            RowApply::Active(target) => (if *target { "enabling…".into() } else { "disabling…".into() }, t::ACCENT),
-            RowApply::Done(target) => (if *target { "enabled ✓".into() } else { "disabled ✓".into() }, t::LIVE_TEXT),
+            RowApply::Active(target) => (if *target { "applying…".into() } else { "disabling…".into() }, t::ACCENT),
+            RowApply::Done => ("applied ✓".into(), t::LIVE_TEXT),
             RowApply::Failed(e) => (format!("failed — {}", short_err(e)), t::DESTRUCTIVE),
         }
     }
@@ -1433,8 +1455,8 @@ fn unattributed_body(app: &App, ui: &mut egui::Ui) {
 // ---- footer ----
 
 fn footer(app: &mut App, ctx: &egui::Context) {
-    let (dis, en) = app.pending();
-    let has_pending = !dis.is_empty() || !en.is_empty();
+    let (dis, en, scope) = app.pending_counts();
+    let has_pending = dis + en + scope > 0;
     let running = app.apply_running();
     let partial = app.apply_partial_failure();
     if !has_pending && !running && !partial {
@@ -1455,25 +1477,26 @@ fn footer(app: &mut App, ctx: &egui::Context) {
             } else if partial {
                 footer_partial(app, ui);
             } else {
-                footer_pending(app, ui, dis.len(), en.len(), ctx);
+                footer_pending(app, ui, dis, en, scope, ctx);
             }
         });
 }
 
-fn footer_pending(app: &mut App, ui: &mut egui::Ui, dis: usize, en: usize, ctx: &egui::Context) {
+fn footer_pending(app: &mut App, ui: &mut egui::Ui, dis: usize, en: usize, scope: usize, ctx: &egui::Context) {
     ui.horizontal_centered(|ui| {
-        let total = dis + en;
+        let total = dis + en + scope;
         let mut job = egui::text::LayoutJob::default();
         job.append(&format!("{total} pending change{}", if total == 1 { "" } else { "s" }), 0.0, fmt(t::semibold(12.0), t::INK));
         job.append("  —  ", 0.0, fmt(t::sans(12.0), t::SECONDARY));
-        if dis > 0 {
-            job.append(&format!("{dis} to disable", ), 0.0, fmt(t::sans(12.0), t::BLOCK));
-        }
-        if dis > 0 && en > 0 {
-            job.append(" · ", 0.0, fmt(t::sans(12.0), t::SECONDARY));
-        }
-        if en > 0 {
-            job.append(&format!("{en} to enable"), 0.0, fmt(t::sans(12.0), t::ENABLE_GREEN));
+        let mut parts: Vec<(String, egui::Color32)> = Vec::new();
+        if dis > 0 { parts.push((format!("{dis} to disable"), t::BLOCK)); }
+        if en > 0 { parts.push((format!("{en} to enable"), t::ENABLE_GREEN)); }
+        if scope > 0 { parts.push((format!("{scope} profile change{}", if scope == 1 { "" } else { "s" }), t::ACCENT)); }
+        for (i, (text, col)) in parts.iter().enumerate() {
+            if i > 0 {
+                job.append(" · ", 0.0, fmt(t::sans(12.0), t::SECONDARY));
+            }
+            job.append(text, 0.0, fmt(t::sans(12.0), *col));
         }
         ui.label(job);
         ui.add_space(14.0);
@@ -1579,8 +1602,9 @@ fn primary_button(ui: &mut egui::Ui, label: &str, fill: Color32) -> egui::Respon
 // ---- confirm modal ----
 
 fn confirm_modal(app: &mut App, ctx: &egui::Context) {
-    let (dis, en) = app.pending();
-    let total = dis.len() + en.len();
+    let plan = app.planned_changes();
+    let total = plan.len();
+    let (dis, en, scope) = app.pending_counts();
     // scrim
     egui::Area::new("scrim".into()).order(egui::Order::Background).show(ctx, |ui| {
         let r = ctx.screen_rect();
@@ -1606,14 +1630,13 @@ fn confirm_modal(app: &mut App, ctx: &egui::Context) {
             section_sep(ui);
             ui.add_space(12.0);
 
-            // change rows
+            // change rows (scrollable — a big batch shouldn't blow the modal)
             pad20(ui, |ui| {
-                for name in dis.iter() {
-                    change_row(app, ui, name, false);
-                }
-                for name in en.iter() {
-                    change_row(app, ui, name, true);
-                }
+                egui::ScrollArea::vertical().max_height(280.0).auto_shrink([false, true]).show(ui, |ui| {
+                    for c in &plan {
+                        change_row(app, ui, c);
+                    }
+                });
             });
 
             // backup box
@@ -1648,12 +1671,11 @@ fn confirm_modal(app: &mut App, ctx: &egui::Context) {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Changes are also written to the audit log.").font(t::sans(11.0)).color(t::FAINT));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let verb = format!(
-                            "Back up & {}{}{}",
-                            if !dis.is_empty() { format!("disable {}", dis.len()) } else { String::new() },
-                            if !dis.is_empty() && !en.is_empty() { ", " } else { "" },
-                            if !en.is_empty() { format!("enable {}", en.len()) } else { String::new() },
-                        );
+                        let mut bits = Vec::new();
+                        if dis > 0 { bits.push(format!("disable {dis}")); }
+                        if en > 0 { bits.push(format!("enable {en}")); }
+                        if scope > 0 { bits.push(format!("rescope {scope}")); }
+                        let verb = format!("Back up & {}", bits.join(", "));
                         if primary_button(ui, &verb, t::DESTRUCTIVE).clicked() {
                             app.confirm_open = false;
                             open = false;
@@ -1674,40 +1696,52 @@ fn confirm_modal(app: &mut App, ctx: &egui::Context) {
     }
 }
 
-fn change_row(app: &App, ui: &mut egui::Ui, name: &str, enable: bool) {
-    let Some(r) = app.rows.iter().find(|r| r.rule.name == name) else { return };
-    let (verb, vc, bg) = if enable {
-        ("ENABLE", t::ENABLE_GREEN, t::BACKUP_BG)
-    } else {
-        ("DISABLE", t::BLOCK, t::VERB_DISABLE_BG)
+fn change_row(app: &App, ui: &mut egui::Ui, c: &super::PlannedChange) {
+    use super::ChangeKind;
+    let r = app.rows.iter().find(|r| r.rule.name == c.name);
+    let (verb, vc, bg, reason) = match &c.kind {
+        ChangeKind::Disable => (
+            "DISABLE",
+            t::BLOCK,
+            t::VERB_DISABLE_BG,
+            r.map(|r| disable_reason(r)).unwrap_or_default(),
+        ),
+        ChangeKind::Enable => (
+            "ENABLE",
+            t::ENABLE_GREEN,
+            t::BACKUP_BG,
+            "currently disabled — will begin allowing this traffic".to_string(),
+        ),
+        ChangeKind::Profiles { arg, removed, .. } => (
+            "RESCOPE",
+            t::ACCENT,
+            t::ACCENT_TINT,
+            format!("remove {removed} — rule stays active on {}", arg.replace(',', ", ")),
+        ),
     };
     egui::Frame::none()
         .fill(bg)
         .inner_margin(egui::Margin::symmetric(10.0, 8.0))
         .show(ui, |ui| {
             ui.horizontal_top(|ui| {
-                ui.allocate_ui_with_layout(Vec2::new(52.0, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                ui.allocate_ui_with_layout(Vec2::new(64.0, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
                     ui.label(egui::RichText::new(verb).font(t::semibold(11.0)).color(vc));
                 });
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 1.0;
-                    ui.label(egui::RichText::new(&r.rule.display_name).font(t::semibold(12.5)).color(t::INK));
-                    ui.label(egui::RichText::new(reason(r, enable)).font(t::sans(11.0)).color(t::TERTIARY));
+                    ui.label(egui::RichText::new(&c.display).font(t::semibold(12.5)).color(t::INK));
+                    ui.label(egui::RichText::new(reason).font(t::sans(11.0)).color(t::TERTIARY));
                 });
             });
         });
     ui.add_space(1.0);
 }
 
-fn reason(r: &super::RuleRow, enable: bool) -> String {
-    if enable {
-        "currently disabled — will begin allowing this traffic".into()
-    } else {
-        let hits = r.total_hits();
-        let flag = r.flags.first().map(|f| format!(" · flagged: {}", f.title)).unwrap_or_default();
-        let listen = if r.listening.is_empty() { " · not listening" } else { "" };
-        format!("{hits} hits in the audit window{listen}{flag}")
-    }
+fn disable_reason(r: &super::RuleRow) -> String {
+    let hits = r.total_hits();
+    let flag = r.flags.first().map(|f| format!(" · flagged: {}", f.title)).unwrap_or_default();
+    let listen = if r.listening.is_empty() { " · not listening" } else { "" };
+    format!("{hits} hits in the audit window{listen}{flag}")
 }
 
 fn pad20(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
