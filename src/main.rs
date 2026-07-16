@@ -12,6 +12,7 @@ mod listeners;
 mod model;
 mod pipeline;
 mod preview;
+mod scope;
 mod secure_dir;
 mod store;
 mod support;

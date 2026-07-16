@@ -70,7 +70,7 @@ fn basename(p: &str) -> &str {
 /// mixed) into inclusive ranges. Symbolic tokens (RPC, RPCEPMap,
 /// PlayToDiscovery, …) are unresolvable here and yield nothing — better no
 /// listener claim than a wrong one.
-fn parse_port_ranges(spec: &str) -> Vec<(u32, u32)> {
+pub(crate) fn parse_port_ranges(spec: &str) -> Vec<(u32, u32)> {
     spec.split(',')
         .filter_map(|entry| {
             let entry = entry.trim();

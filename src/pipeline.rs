@@ -272,27 +272,16 @@ pub fn analyze(db_path: &Path, progress: &dyn Fn(&str)) -> Result<AnalysisResult
         }
     }
 
-    // Attribution model (see the on-device support export that established
-    // it): every 5156/5157 event on modern Windows carries a FilterOrigin
-    // string naming the deciding filter. For firewall-rule decisions that is
-    // the rule's DisplayName (or Name); for default/system filters it's a
-    // description like "Unknown", "AppContainer Loopback", "Default
-    // Outbound", "Stealth". We therefore attribute by FilterOrigin — no WFP
-    // filter enumeration, no per-boot filter run-time IDs (both proved
-    // useless: providerData holds an opaque numeric id, not the rule name).
-    //
-    // Match key precedence: exact rule Name (InstanceID) → (DisplayName,
-    // direction) group → default:<origin> bucket. Same-DisplayName profile
-    // variants share one "disp:" group key so a used rule credits all its
-    // profile variants without inflating counts.
-    let rule_by_name: std::collections::HashMap<String, String> = rules
-        .iter()
-        .map(|r| (r.name.to_lowercase(), r.name.clone()))
-        .collect();
-    let display_dir_keys: std::collections::HashSet<String> = rules
-        .iter()
-        .map(|r| disp_key(&r.display_name, &r.direction))
-        .collect();
+    // Attribution model (established from the on-device support export):
+    // Windows' FilterOrigin names the *decisive* filter, which for allowed
+    // traffic is frequently a system default (mDNS/UDP-5353 and ICMP pings
+    // arrive with FilterOrigin "Unknown"), not the user's rule. So we
+    // attribute by *scope*: credit every rule whose direction + protocol +
+    // local/remote port + program the connection satisfies. One connection
+    // can credit several overlapping rules — correct for "is this rule
+    // exercised". FilterOrigin is used only to label events that match no
+    // rule scope (pure default/system traffic) in the Unattributed panel.
+    let scope_index = crate::scope::ScopeIndex::build(&rules);
 
     // everything from here to the checkpoint advance is one transaction:
     // a crash rolls back cleanly and a rerun re-ingests without double-count
@@ -313,28 +302,27 @@ pub fn analyze(db_path: &Path, progress: &dyn Fn(&str)) -> Result<AnalysisResult
         if max_record_id.map_or(true, |m| ev.record_id > m) {
             max_record_id = Some(ev.record_id);
         }
-        let origin = ev.filter_origin.as_deref().unwrap_or("Unknown").trim();
-        let origin_lc = origin.to_lowercase();
-        let rule_id = if let Some(name) = rule_by_name.get(&origin_lc) {
-            // FilterOrigin was the rule InstanceID
-            name.clone()
-        } else {
-            let dk = disp_key(origin, &ev.direction);
-            if display_dir_keys.contains(&dk) {
-                // FilterOrigin was the rule DisplayName (credits all profile
-                // variants of that name+direction)
-                dk
-            } else {
-                // default/system filter — not a firewall rule
-                unmatched_events += 1;
-                let bucket = format!("default:{}", if origin.is_empty() { "Unknown" } else { origin });
-                bucket_labels.entry(bucket.clone()).or_insert_with(|| origin.to_string());
-                bucket
-            }
-        };
         let app = app_identity::normalize_path(&ev.application, &device_map);
-        if store.record_event(&rule_id, &ev, &app).is_err() {
-            errors += 1;
+        let conn = crate::scope::Conn::from_event(&ev, &app);
+        let matched = scope_index.matching_rules(&conn);
+        if matched.is_empty() {
+            // no rule's scope covers this connection — a default/system
+            // filter allowed/blocked it. Bucket by FilterOrigin.
+            unmatched_events += 1;
+            let origin = ev.filter_origin.as_deref().unwrap_or("Unknown").trim();
+            let origin = if origin.is_empty() { "Unknown" } else { origin };
+            let bucket = format!("default:{origin}");
+            bucket_labels.entry(bucket.clone()).or_insert_with(|| origin.to_string());
+            if store.record_event(&bucket, &ev, &app).is_err() {
+                errors += 1;
+            }
+        } else {
+            // credit every rule whose scope this connection matches
+            for rule_name in matched {
+                if store.record_event(rule_name, &ev, &app).is_err() {
+                    errors += 1;
+                }
+            }
         }
     });
     if let Err(e) = ingest {
