@@ -20,6 +20,7 @@ mod syspath;
 mod theme;
 mod time_util;
 mod ui;
+mod update;
 
 use anyhow::{bail, Result};
 
@@ -104,6 +105,9 @@ fn main() -> Result<()> {
     if args.ui_preview {
         return preview::run();
     }
+
+    // clear a leftover exe image from a prior self-update
+    update::cleanup_old();
 
     if !elevation::is_elevated() {
         // the embedded manifest normally forces a UAC prompt at launch;

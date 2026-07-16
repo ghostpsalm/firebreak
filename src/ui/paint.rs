@@ -453,11 +453,9 @@ fn settings_menu(app: &mut App, _ui: &mut egui::Ui, ctx: &egui::Context, anchor:
                 }
                 ui.separator();
                 if menu_item(ui, "Check for updates…", true) {
-                    app.status = format!(
-                        "firebreak {} — no update channel configured; check your source for newer builds.",
-                        crate::pipeline::version_string()
-                    );
+                    app.about_open = true;
                     app.settings_open = false;
+                    app.spawn_update_check(ctx.clone());
                 }
                 if menu_item(ui, "About firebreak", true) {
                     app.about_open = true;
@@ -600,6 +598,8 @@ fn about_box(app: &mut App, ctx: &egui::Context) {
                 ui.add_space(20.0);
                 ui.label(egui::RichText::new(format!("Host: {}", app.ctx_info.hostname)).font(t::mono(11.0)).color(t::TERTIARY()));
             });
+            ui.add_space(16.0);
+            about_updates(app, ui, ctx);
             ui.add_space(14.0);
             ui.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -613,6 +613,57 @@ fn about_box(app: &mut App, ctx: &egui::Context) {
         });
     if !open {
         app.about_open = false;
+    }
+}
+
+/// The "Updates" section inside the About box: a one-line status and, when
+/// there's something to do, a single primary button.
+fn about_updates(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
+    use crate::ui::UpdateState;
+    enum Act {
+        None,
+        Check,
+        Download,
+        Restart(std::path::PathBuf),
+    }
+    // snapshot the shared state, then release the lock before touching `app`
+    let (line, color, act, btn): (String, Color32, Act, Option<&str>) = {
+        let st = app.update.lock().unwrap();
+        match &*st {
+            UpdateState::Idle => ("Check whether a newer build is available.".into(), t::SECONDARY(), Act::Check, Some("Check now")),
+            UpdateState::Checking => ("Checking for updates…".into(), t::SECONDARY(), Act::None, None),
+            UpdateState::UpToDate(v) => (format!("You're on the latest version ({v})."), t::SECONDARY(), Act::None, None),
+            UpdateState::Available(rel) => (format!("Version {} is available (you have {}).", rel.latest, rel.current), t::INK(), Act::Download, Some("Download & install")),
+            UpdateState::Downloading => ("Downloading update…".into(), t::SECONDARY(), Act::None, None),
+            UpdateState::Ready(exe) => ("Update installed — restart to finish.".into(), t::INK(), Act::Restart(exe.clone()), Some("Restart now")),
+            UpdateState::Error(e) => (e.clone(), t::DESTRUCTIVE(), Act::Check, Some("Try again")),
+        }
+    };
+
+    ui.horizontal(|ui| {
+        ui.add_space(20.0);
+        ui.label(egui::RichText::new("UPDATES").font(t::semibold(9.5)).color(t::TERTIARY()));
+    });
+    ui.add_space(4.0);
+    ui.horizontal_wrapped(|ui| {
+        ui.add_space(20.0);
+        ui.set_max_width(300.0);
+        ui.spacing_mut().item_spacing.x = 0.0;
+        ui.label(egui::RichText::new(&line).font(t::sans(11.5)).color(color));
+    });
+    if let Some(label) = btn {
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.add_space(20.0);
+            if primary_button(ui, label, t::ACCENT()).clicked() {
+                match act {
+                    Act::Check => app.spawn_update_check(ctx.clone()),
+                    Act::Download => app.spawn_update_download(ctx.clone()),
+                    Act::Restart(exe) => crate::update::restart(&exe),
+                    Act::None => {}
+                }
+            }
+        });
     }
 }
 

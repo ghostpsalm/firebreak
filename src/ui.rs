@@ -83,6 +83,17 @@ enum WorkerMsg {
     Failed(String),
 }
 
+/// Where the self-update flow is, shown in the About box.
+pub(crate) enum UpdateState {
+    Idle,
+    Checking,
+    UpToDate(String),
+    Available(crate::update::Release),
+    Downloading,
+    Ready(std::path::PathBuf),
+    Error(String),
+}
+
 /// One planned firewall change, ready to apply and describe.
 #[derive(Clone)]
 pub(crate) struct PlannedChange {
@@ -238,6 +249,7 @@ pub struct App {
     settings_open: bool,
     about_open: bool,
     pub(crate) dark_mode: bool,
+    pub(crate) update: std::sync::Arc<std::sync::Mutex<UpdateState>>,
     /// lazily-loaded app logo for the title bar
     pub(crate) logo: Option<egui::TextureHandle>,
     /// scratch DB for the current .evtx import session (persists across
@@ -279,6 +291,7 @@ impl App {
             settings_open: false,
             about_open: false,
             dark_mode: false,
+            update: std::sync::Arc::new(std::sync::Mutex::new(UpdateState::Idle)),
             logo: None,
             import_db: None,
         }
@@ -348,6 +361,35 @@ impl App {
                 };
                 let _ = tx.send(msg);
             }
+            egui_ctx.request_repaint();
+        });
+    }
+
+    /// Query GitHub for the latest release on a worker thread.
+    pub(crate) fn spawn_update_check(&mut self, egui_ctx: egui::Context) {
+        *self.update.lock().unwrap() = UpdateState::Checking;
+        let slot = self.update.clone();
+        std::thread::spawn(move || {
+            let next = match crate::update::check() {
+                Ok(rel) if rel.newer => UpdateState::Available(rel),
+                Ok(rel) => UpdateState::UpToDate(rel.current),
+                Err(e) => UpdateState::Error(format!("{e:#}")),
+            };
+            *slot.lock().unwrap() = next;
+            egui_ctx.request_repaint();
+        });
+    }
+
+    /// Download and stage the newest build on a worker thread.
+    pub(crate) fn spawn_update_download(&mut self, egui_ctx: egui::Context) {
+        *self.update.lock().unwrap() = UpdateState::Downloading;
+        let slot = self.update.clone();
+        std::thread::spawn(move || {
+            let next = match crate::update::download_and_install() {
+                Ok(exe) => UpdateState::Ready(exe),
+                Err(e) => UpdateState::Error(format!("{e:#}")),
+            };
+            *slot.lock().unwrap() = next;
             egui_ctx.request_repaint();
         });
     }
@@ -425,6 +467,15 @@ impl App {
             }
             Ok("modal") => app.confirm_open = true,
             Ok("settings") => app.settings_open = true,
+            Ok("about") => app.about_open = true,
+            Ok("update") => {
+                app.about_open = true;
+                *app.update.lock().unwrap() = UpdateState::Available(crate::update::Release {
+                    latest: "0.5.4.1287".into(),
+                    current: crate::pipeline::version_string(),
+                    newer: true,
+                });
+            }
             Ok("selected") => app.selected = Some(0),
             Ok("profiles") => {
                 // demo: remove Public from a multi-profile rule + a disable
