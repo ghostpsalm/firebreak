@@ -67,7 +67,7 @@ fn parse_args() -> Args {
             },
             "--help" | "-h" => {
                 println!(
-                    "firebreak — Windows Firewall rule-usage auditor\n\n\
+                    "Firebreak — Windows Firewall rule-usage auditor\n\n\
                      Run without arguments for the app: it boots to the rule table, offers an\n\
                      'Enable connection auditing' button on first run, and on later runs\n\
                      ingests new 5156/5157 events and correlates them to firewall rules.\n\n\
