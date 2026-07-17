@@ -94,6 +94,15 @@ impl Store {
                 snapshot_at  TEXT NOT NULL,
                 rule_json    TEXT NOT NULL
             );
+
+            -- user attestation: this rule (at this definition fingerprint)
+            -- has been verified. A user artifact, not derived data — it
+            -- survives ingestion resets and model-version wipes.
+            CREATE TABLE IF NOT EXISTS reviewed_rules (
+                rule_id     TEXT PRIMARY KEY,
+                fingerprint TEXT NOT NULL,
+                reviewed_at TEXT NOT NULL
+            );
             "#,
         )?;
         let store = Store { conn };
@@ -169,6 +178,37 @@ impl Store {
         let mut stmt = self.conn.prepare_cached("DELETE FROM meta WHERE key = ?1")?;
         stmt.execute(params![key])?;
         Ok(())
+    }
+
+    // ---- reviewed marks ----
+
+    /// Mark a rule as reviewed at its current definition fingerprint.
+    pub fn set_reviewed(&self, rule_id: &str, fingerprint: &str, reviewed_at: &str) -> Result<()> {
+        let mut stmt = self.conn.prepare_cached(
+            "INSERT INTO reviewed_rules (rule_id, fingerprint, reviewed_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(rule_id) DO UPDATE SET fingerprint = excluded.fingerprint,
+                                                reviewed_at = excluded.reviewed_at",
+        )?;
+        stmt.execute(params![rule_id, fingerprint, reviewed_at])?;
+        Ok(())
+    }
+
+    pub fn clear_reviewed(&self, rule_id: &str) -> Result<()> {
+        let mut stmt = self.conn.prepare_cached("DELETE FROM reviewed_rules WHERE rule_id = ?1")?;
+        stmt.execute(params![rule_id])?;
+        Ok(())
+    }
+
+    /// rule_id -> (fingerprint, reviewed_at)
+    pub fn load_reviewed(&self) -> Result<std::collections::HashMap<String, (String, String)>> {
+        let mut stmt = self.conn.prepare("SELECT rule_id, fingerprint, reviewed_at FROM reviewed_rules")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, (r.get::<_, String>(1)?, r.get::<_, String>(2)?))))?;
+        let mut map = std::collections::HashMap::new();
+        for row in rows {
+            let (k, v) = row?;
+            map.insert(k, v);
+        }
+        Ok(map)
     }
 
     /// Last-processed EventRecordID (Security channel). The next ingest

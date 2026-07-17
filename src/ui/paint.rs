@@ -94,6 +94,25 @@ mod glyph {
         );
     }
 
+    /// Circled check — the "Reviewed" mark. Round on purpose: visually
+    /// distinct from the square enable/disable checkbox.
+    pub fn circle_check(p: &egui::Painter, center: Pos2, filled: bool, circle: Color32, mark: Color32) {
+        if filled {
+            p.circle_filled(center, 7.5, circle);
+        } else {
+            p.circle_stroke(center, 7.0, Stroke::new(1.3, circle));
+        }
+        let s = 7.5;
+        p.line_segment(
+            [Pos2::new(center.x - s * 0.32, center.y + s * 0.02), Pos2::new(center.x - s * 0.08, center.y + s * 0.30)],
+            Stroke::new(1.5, mark),
+        );
+        p.line_segment(
+            [Pos2::new(center.x - s * 0.08, center.y + s * 0.30), Pos2::new(center.x + s * 0.36, center.y - s * 0.26)],
+            Stroke::new(1.5, mark),
+        );
+    }
+
     /// Sun: a small disc with eight rays (shown in dark mode → click for light).
     pub fn sun(p: &egui::Painter, center: Pos2, color: Color32) {
         p.circle_filled(center, 3.2, color);
@@ -846,6 +865,7 @@ fn filter_bar(app: &mut App, ctx: &egui::Context) {
                     ("Enabled only", &mut app.only_enabled, true, "Show only rules that are currently enabled (hide disabled ones)"),
                     ("Zero-hit", &mut app.only_zero_hit, zero_enabled, "Show only rules with no observed traffic — the disable candidates"),
                     ("Flagged", &mut app.only_flagged, true, "Show only rules with a security advisory (e.g. RDP, SMB-inbound, broad allow, mDNS)"),
+                    ("Hide reviewed", &mut app.hide_reviewed, true, "Hide rules you've marked as reviewed (the circle in the right-most column) — tick rules off to work the list down to zero"),
                 ]);
                 ui.add_space(4.0);
                 segmented_toggles(ui, &mut [
@@ -933,11 +953,12 @@ struct Cols {
     last: (f32, f32),
     apps: (f32, f32),
     listen: (f32, f32),
+    reviewed: (f32, f32),
 }
 
 impl Cols {
     fn compute(left: f32, width: f32, cw: &super::ColWidths) -> Cols {
-        let fixed_others = 34.0 + cw.dir + cw.action + cw.profiles + cw.scope + cw.hits + cw.last + cw.listen;
+        let fixed_others = 34.0 + cw.dir + cw.action + cw.profiles + cw.scope + cw.hits + cw.last + cw.listen + cw.reviewed;
         let (name_w, apps_w) = if cw.name > 0.0 {
             // Rule pinned to a set width; Apps takes the remaining flex
             let name_w = cw.name.clamp(120.0, width - fixed_others - 100.0);
@@ -965,6 +986,7 @@ impl Cols {
             last: col(cw.last),
             apps: col(apps_w),
             listen: col(cw.listen),
+            reviewed: col(cw.reviewed),
         }
     }
 }
@@ -1005,7 +1027,7 @@ fn central(app: &mut App, ctx: &egui::Context) {
                 |ui, range| {
                     for vi in range {
                         let ri = visible[vi];
-                        let (rect, resp) = ui.allocate_exact_size(Vec2::new(cols.listen.0 + cols.listen.1 - full.left(), ROW_H), Sense::click());
+                        let (rect, resp) = ui.allocate_exact_size(Vec2::new(cols.reviewed.0 + cols.reviewed.1 - full.left(), ROW_H), Sense::click());
                         let rc = Cols::compute(rect.left(), rect.width(), &cw);
                         row(app, ui, ri, rect, &rc, resp);
                     }
@@ -1025,7 +1047,7 @@ fn resize_handles(app: &mut App, ui: &mut egui::Ui, cols: &Cols, header_rect: Re
     // Rule width is "auto" (0) until first dragged — seed it with the
     // current computed width so the drag starts from the right place.
     let name_seed = cols.name.1;
-    let edges: [(f32, fn(&mut super::ColWidths) -> &mut f32, f32); 8] = [
+    let edges: [(f32, fn(&mut super::ColWidths) -> &mut f32, f32); 9] = [
         (cols.name.0 + cols.name.1, |c| &mut c.name, 1.0), // Rule
         (cols.dir.0 + cols.dir.1, |c| &mut c.dir, 1.0),
         (cols.action.0 + cols.action.1, |c| &mut c.action, 1.0),
@@ -1033,7 +1055,8 @@ fn resize_handles(app: &mut App, ui: &mut egui::Ui, cols: &Cols, header_rect: Re
         (cols.scope.0 + cols.scope.1, |c| &mut c.scope, 1.0),
         (cols.hits.0 + cols.hits.1, |c| &mut c.hits, 1.0),
         (cols.last.0 + cols.last.1, |c| &mut c.last, 1.0),
-        (cols.listen.0, |c| &mut c.listen, -1.0), // Listening (left edge)
+        (cols.listen.0, |c| &mut c.listen, -1.0),   // Listening (left edge)
+        (cols.reviewed.0, |c| &mut c.reviewed, -1.0), // Reviewed (left edge)
     ];
     for (i, (x, sel, sign)) in edges.into_iter().enumerate() {
         let hit = Rect::from_min_max(Pos2::new(x - 3.0, header_rect.top()), Pos2::new(x + 3.0, header_rect.bottom()));
@@ -1094,8 +1117,9 @@ fn table_header(ui: &mut egui::Ui, app: &mut App, cols: &Cols) {
         if header_cell(app, ui, cols.apps, rect, "Apps observed", Sort::Apps, c).clicked() { toggle_sort(app, Sort::Apps); }
         if header_cell(app, ui, cols.listen, rect, "Listening now", Sort::Listening, c).clicked() { toggle_sort(app, Sort::Listening); }
     }
+    if header_cell(app, ui, cols.reviewed, rect, "Reviewed", Sort::Reviewed, c).clicked() { toggle_sort(app, Sort::Reviewed); }
     // column separators
-    for x in [cols.name.0, cols.dir.0, cols.action.0, cols.profiles.0, cols.scope.0, cols.hits.0, cols.last.0, cols.apps.0, cols.listen.0] {
+    for x in [cols.name.0, cols.dir.0, cols.action.0, cols.profiles.0, cols.scope.0, cols.hits.0, cols.last.0, cols.apps.0, cols.listen.0, cols.reviewed.0] {
         ui.painter().vline(x, rect.y_range(), Stroke::new(1.0, t::BORDER_LIGHT()));
     }
     // resize handles on the fixed-column right edges
@@ -1176,7 +1200,7 @@ fn row(app: &mut App, ui: &mut egui::Ui, ri: usize, rect: Rect, cols: &Cols, res
     p.hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, t::ROW_BORDER()));
     // faint column separators, aligned with the header's
     let sep = Stroke::new(1.0, t::ROW_BORDER());
-    for x in [cols.name.0, cols.dir.0, cols.action.0, cols.profiles.0, cols.scope.0, cols.hits.0, cols.last.0, cols.apps.0, cols.listen.0] {
+    for x in [cols.name.0, cols.dir.0, cols.action.0, cols.profiles.0, cols.scope.0, cols.hits.0, cols.last.0, cols.apps.0, cols.listen.0, cols.reviewed.0] {
         p.vline(x, rect.y_range(), sep);
     }
     // edge bar
@@ -1290,6 +1314,41 @@ fn row(app: &mut App, ui: &mut egui::Ui, ri: usize, rect: Rect, cols: &Cols, res
         }
     }
 
+    // reviewed mark — a ROUND control, deliberately unlike the square
+    // enable checkbox: ticking it attests "I've verified this rule",
+    // it never changes the firewall
+    use crate::ui::ReviewState;
+    let rv_center = Pos2::new(cols.reviewed.0 + CELL_PAD + 10.0, rect.center().y);
+    let rv_tip = match &r.reviewed {
+        ReviewState::Yes(at) => {
+            glyph::circle_check(ui.painter(), rv_center, true, t::ENABLE_GREEN(), Color32::WHITE);
+            format!("Reviewed {at} — click to clear")
+        }
+        ReviewState::Stale(at) => {
+            ui.painter().circle_stroke(rv_center, 7.0, Stroke::new(1.3, t::ADVISORY()));
+            // exclamation: stem + dot
+            ui.painter().line_segment(
+                [Pos2::new(rv_center.x, rv_center.y - 3.6), Pos2::new(rv_center.x, rv_center.y + 0.8)],
+                Stroke::new(1.5, t::ADVISORY()),
+            );
+            ui.painter().circle_filled(Pos2::new(rv_center.x, rv_center.y + 3.4), 0.9, t::ADVISORY());
+            format!("Was reviewed {at}, but the rule definition has changed since — verify again and click to re-mark")
+        }
+        ReviewState::No => {
+            ui.painter().circle_stroke(rv_center, 7.0, Stroke::new(1.3, t::CB_EMPTY_BORDER()));
+            "Mark this rule as reviewed/verified (does not change the firewall)".to_string()
+        }
+    };
+    let rv_resp = ui.interact(
+        Rect::from_center_size(rv_center, Vec2::splat(15.0)).expand(4.0),
+        ui.id().with(("rv", ri)),
+        Sense::click(),
+    );
+    if rv_resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    rv_resp.clone().on_hover_text(rv_tip);
+
     // tooltip built while the immutable borrow is live, so mutations below
     // don't overlap it
     let tip = format!(
@@ -1308,6 +1367,8 @@ fn row(app: &mut App, ui: &mut egui::Ui, ri: usize, rect: Rect, cols: &Cols, res
         }
     } else if cb_resp.clicked() && app.apply.is_none() {
         app.rows[ri].target_enabled = !app.rows[ri].target_enabled;
+    } else if rv_resp.clicked() {
+        app.toggle_reviewed(ri);
     } else if resp.clicked() {
         app.selected = if selected { None } else { Some(ri) };
     }

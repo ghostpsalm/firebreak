@@ -40,6 +40,28 @@ impl RuleInfo {
         self.enabled.eq_ignore_ascii_case("true")
     }
 
+    /// Security-relevant definition of the rule, as a stable string. Backs
+    /// the "Reviewed" mark: a review attests to THIS definition, so any
+    /// change here invalidates it. Deliberately excludes the enabled state
+    /// (disabling a reviewed rule — e.g. via firebreak itself — is not a
+    /// definition change) and cosmetic fields (display name, description,
+    /// group).
+    pub fn fingerprint(&self) -> String {
+        let f = |o: &Option<String>| o.as_deref().unwrap_or("").to_string();
+        format!(
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            self.direction,
+            self.action,
+            self.profile,
+            f(&self.program),
+            f(&self.protocol),
+            f(&self.local_port),
+            f(&self.remote_port),
+            f(&self.service),
+            f(&self.remote_address),
+        )
+    }
+
     /// Profile tags for display: ["Domain"], ["Private", "Public"], … or
     /// ["Any"]. Unknown/NotApplicable values render as-is so nothing is
     /// silently hidden.

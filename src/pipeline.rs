@@ -233,7 +233,8 @@ pub fn import_evtx(
     progress("Building report…");
     let listener_list = Vec::new(); // listeners are local/live; N/A for an import
     let all_usage = store.all_usage()?;
-    let rows = build_rows(rules, &all_usage, &listener_list);
+    let reviewed = store.load_reviewed().unwrap_or_default();
+    let rows = build_rows(rules, &all_usage, &listener_list, &reviewed);
     let unmatched = build_unmatched(&store)?;
     // scratch DB is kept for the session so further "Add" imports accumulate
 
@@ -314,6 +315,7 @@ fn build_rows(
     rules: Vec<crate::model::RuleInfo>,
     all_usage: &std::collections::HashMap<String, RuleUsage>,
     listener_list: &[Listener],
+    reviewed: &std::collections::HashMap<String, (String, String)>,
 ) -> Vec<ui::RuleRow> {
     rules
         .into_iter()
@@ -341,7 +343,14 @@ fn build_rows(
             let listening = listeners::listeners_for_rule(&rule, listener_list);
             let target_enabled = rule.is_enabled();
             let target_profiles = crate::model::ProfileSet::from_rule(&rule);
-            ui::RuleRow { rule, usage, flags, seen_apps, listening, target_enabled, target_profiles }
+            // a review attests to a specific definition: on fingerprint
+            // mismatch the mark goes stale and the rule resurfaces
+            let review = match reviewed.get(&rule.name) {
+                Some((fp, at)) if *fp == rule.fingerprint() => ui::ReviewState::Yes(at.clone()),
+                Some((_, at)) => ui::ReviewState::Stale(at.clone()),
+                None => ui::ReviewState::No,
+            };
+            ui::RuleRow { rule, usage, flags, seen_apps, listening, target_enabled, target_profiles, reviewed: review }
         })
         .collect()
 }
@@ -373,7 +382,8 @@ pub fn quick_cached_result(db_path: &Path) -> Option<AnalysisResult> {
     let store = Store::open(db_path).ok()?;
     let all_usage = store.all_usage().ok()?;
     let listener_list = listeners::enumerate_listeners().unwrap_or_default();
-    let rows = build_rows(rules, &all_usage, &listener_list);
+    let reviewed = store.load_reviewed().unwrap_or_default();
+    let rows = build_rows(rules, &all_usage, &listener_list, &reviewed);
     let unmatched = build_unmatched(&store).unwrap_or_default();
     Some(AnalysisResult {
         rows,
@@ -400,7 +410,7 @@ pub fn rules_only(progress: &dyn Fn(&str)) -> Result<AnalysisResult> {
     progress("Enumerating listening sockets…");
     let listeners = listeners::enumerate_listeners().unwrap_or_default();
     let empty = std::collections::HashMap::new();
-    let rows = build_rows(rules, &empty, &listeners);
+    let rows = build_rows(rules, &empty, &listeners, &std::collections::HashMap::new());
     Ok(AnalysisResult {
         rows,
         ctx: ui::AuditContext {
@@ -542,7 +552,8 @@ pub fn analyze(db_path: &Path, progress: &dyn Fn(&str)) -> Result<AnalysisResult
         let _ = store.set_bucket_label(id, label);
     }
     let all_usage = store.all_usage()?;
-    let rows = build_rows(rules, &all_usage, &listener_list);
+    let reviewed = store.load_reviewed().unwrap_or_default();
+    let rows = build_rows(rules, &all_usage, &listener_list, &reviewed);
     let unmatched = build_unmatched(&store)?;
 
     let ctx = ui::AuditContext {

@@ -156,13 +156,20 @@ pub fn run() -> Result<()> {
         listener("TCP", "127.0.0.1", 27060, 8100, "steam", r"C:\Program Files (x86)\Steam\steam.exe"),
     ];
 
-    let rows = specs
+    let rows: Vec<ui::RuleRow> = specs
         .into_iter()
         .map(|(rule, usage, apps, pending)| {
             let flags = baseline_checks::flags_for(&rule);
             let listening = listeners::listeners_for_rule(&rule, &mock_listeners);
             let target_enabled = pending.unwrap_or_else(|| rule.is_enabled());
             let target_profiles = crate::model::ProfileSet::from_rule(&rule);
+            // demo reviewed states: one verified, one stale (rule changed
+            // since it was checked)
+            let reviewed = match rule.display_name.as_str() {
+                "OpenSSH SSH Server (sshd)" => ui::ReviewState::Yes("2026-07-12".into()),
+                "AnyDesk (TCP-In)" => ui::ReviewState::Stale("2026-06-30".into()),
+                _ => ui::ReviewState::No,
+            };
             ui::RuleRow {
                 rule,
                 usage,
@@ -171,6 +178,7 @@ pub fn run() -> Result<()> {
                 listening,
                 target_enabled,
                 target_profiles,
+                reviewed,
             }
         })
         .collect();

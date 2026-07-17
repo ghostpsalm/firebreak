@@ -27,6 +27,29 @@ pub struct RuleRow {
     pub target_enabled: bool,
     /// intended profile scope (edited via the profile chips)
     pub target_profiles: crate::model::ProfileSet,
+    pub reviewed: ReviewState,
+}
+
+/// User attestation state for a rule. `Stale` = it was reviewed, but the
+/// rule's definition has changed since — the mark no longer applies and the
+/// rule resurfaces for re-verification.
+#[derive(Clone, PartialEq, Default)]
+pub enum ReviewState {
+    #[default]
+    No,
+    Stale(String),
+    Yes(String),
+}
+
+impl ReviewState {
+    /// Sort rank: unreviewed first, then stale, then reviewed.
+    fn rank(&self) -> u8 {
+        match self {
+            ReviewState::No => 0,
+            ReviewState::Stale(_) => 1,
+            ReviewState::Yes(_) => 2,
+        }
+    }
 }
 
 impl RuleRow {
@@ -160,6 +183,7 @@ pub(crate) enum Sort {
     LastSeen,
     Apps,
     Listening,
+    Reviewed,
 }
 
 impl Sort {
@@ -190,11 +214,12 @@ pub(crate) struct ColWidths {
     pub hits: f32,
     pub last: f32,
     pub listen: f32,
+    pub reviewed: f32,
 }
 
 impl Default for ColWidths {
     fn default() -> Self {
-        ColWidths { name: 0.0, dir: 44.0, action: 54.0, profiles: 118.0, scope: 150.0, hits: 100.0, last: 78.0, listen: 132.0 }
+        ColWidths { name: 0.0, dir: 44.0, action: 54.0, profiles: 118.0, scope: 150.0, hits: 100.0, last: 78.0, listen: 132.0, reviewed: 78.0 }
     }
 }
 
@@ -227,6 +252,7 @@ pub struct App {
     only_enabled: bool,
     only_zero_hit: bool,
     only_flagged: bool,
+    hide_reviewed: bool,
     show_domain: bool,
     show_private: bool,
     show_public: bool,
@@ -273,6 +299,7 @@ impl App {
             only_enabled: true,
             only_zero_hit: false,
             only_flagged: false,
+            hide_reviewed: true,
             show_domain: true,
             show_private: true,
             show_public: true,
@@ -363,6 +390,32 @@ impl App {
             }
             egui_ctx.request_repaint();
         });
+    }
+
+    /// Flip a rule's reviewed mark and persist it. Reviewing records the
+    /// rule's current definition fingerprint; un-reviewing (from either the
+    /// reviewed or the stale state) deletes the record.
+    pub(crate) fn toggle_reviewed(&mut self, ri: usize) {
+        let (next, write): (ReviewState, Option<Option<(String, String)>>) = {
+            let r = &self.rows[ri];
+            match r.reviewed {
+                ReviewState::Yes(_) => (ReviewState::No, Some(None)),
+                _ => {
+                    let at = chrono::Utc::now().format("%Y-%m-%d").to_string();
+                    (ReviewState::Yes(at.clone()), Some(Some((r.rule.fingerprint(), at))))
+                }
+            }
+        };
+        if let (Some(db), Some(op)) = (self.db_path.clone(), write) {
+            let name = self.rows[ri].rule.name.clone();
+            if let Ok(store) = crate::store::Store::open(&db) {
+                let _ = match op {
+                    Some((fp, at)) => store.set_reviewed(&name, &fp, &at),
+                    None => store.clear_reviewed(&name),
+                };
+            }
+        }
+        self.rows[ri].reviewed = next;
     }
 
     /// Query GitHub for the latest release on a worker thread.
@@ -787,6 +840,9 @@ impl App {
                 if self.only_flagged && r.flags.is_empty() {
                     return false;
                 }
+                if self.hide_reviewed && matches!(r.reviewed, ReviewState::Yes(_)) {
+                    return false;
+                }
                 if !r.rule.applies_to_profile(self.show_domain, self.show_private, self.show_public) {
                     return false;
                 }
@@ -817,6 +873,7 @@ impl App {
                 }
                 Sort::Apps => ra.seen_apps.join(",").to_lowercase().cmp(&rb.seen_apps.join(",").to_lowercase()),
                 Sort::Listening => ra.listening.join(",").cmp(&rb.listening.join(",")),
+                Sort::Reviewed => ra.reviewed.rank().cmp(&rb.reviewed.rank()),
             };
             if self.sort_asc { ord } else { ord.reverse() }
         });
