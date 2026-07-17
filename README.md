@@ -21,6 +21,35 @@ and run it. Windows may warn on the unsigned binary — SmartScreen → *More
 info → Run anyway*. Firebreak can also update itself in place (**About → Check
 for updates**).
 
+**Requires:** Windows 10 or later / Windows Server 2016 or later, and
+administrator rights.
+
+## Start collecting early (important)
+
+Firebreak doesn't capture packets — it reads evidence that **Windows itself
+records** once "Filtering Platform Connection" auditing is enabled. That
+auditing is off by default, and there is **no retroactive data**: evidence
+only accrues from the moment it's switched on. Enable it as early as you can,
+then come back — good zero-hit conclusions need the collection window to cover
+weekly and monthly activity (backup agents, license checks), so think **weeks,
+not hours**.
+
+Two ways to start the clock:
+
+1. **Run Firebreak** and click **Enable connection auditing** — it records the
+   prior state first (reversible via `--restore-audit`), then enables auditing
+   and grows the Security log so history survives until you return.
+2. **No install needed** — run this on the target ahead of time (elevated),
+   and Firebreak will adopt the accumulated history whenever you first run it:
+
+   ```
+   auditpol /set /subcategory:{0CCE9226-69AE-11D9-BED3-505054503030} /success:enable /failure:enable
+   wevtutil sl Security /ms:536870912
+   ```
+
+   (The second line grows the Security log to 512 MiB — the default 20 MiB
+   rolls over in hours on a busy host, silently discarding your evidence.)
+
 ## Build from source
 
 Native on Windows: `cargo build --release`

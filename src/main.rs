@@ -67,23 +67,46 @@ fn parse_args() -> Args {
             },
             "--help" | "-h" => {
                 println!(
-                    "Firebreak — Windows Firewall rule-usage auditor\n\n\
+                    "Firebreak — Observe first. Enforce with confidence.\n\
+                     Windows Firewall rule-usage auditor.\n\n\
+                     USAGE:\n\
+                     \x20 firebreak [OPTIONS]\n\n\
                      Run without arguments for the app: it boots to the rule table, offers an\n\
                      'Enable connection auditing' button on first run, and on later runs\n\
-                     ingests new 5156/5157 events and correlates them to firewall rules.\n\n\
-                     Options:\n\
-                     \x20 --enable-only    enable auditing + snapshot rules, then exit (headless)\n\
-                     \x20 --no-ui          ingest and print a text report instead of the UI\n\
-                     \x20 --dump-filters   dump the live WFP filter table (for verifying\n\
-                     \x20                  the filter->rule mapping) and exit\n\
-                     \x20 --export-support write a full diagnostic bundle to the Desktop\n\
-                     \x20                  (audit state, rules, filters, event attribution probe)\n\
-                     \x20 --restore-audit  restore the audit policy and Security log size\n\
-                     \x20                  recorded before firebreak first changed them\n\
-                     \x20 --reset          clear collected usage + checkpoint; next run\n\
-                     \x20                  re-scans the whole Security log\n\
-                     \x20 --ui-preview     open the UI with mock data (no elevation needed)\n\
-                     \x20 --db <path>      database path (default %ProgramData%\\firebreak\\firebreak.db)"
+                     ingests new 5156/5157 events and correlates them to firewall rules.\n\
+                     All options require elevation except --ui-preview and --help.\n\n\
+                     COLLECTION:\n\
+                     \x20 --enable-only     enable connection auditing, snapshot the rule set,\n\
+                     \x20                   and exit without opening the UI. Records the prior\n\
+                     \x20                   audit state first so --restore-audit can undo it.\n\
+                     \x20                   Use to start the collection clock on a host you'll\n\
+                     \x20                   analyze later. Read-only apart from the audit policy\n\
+                     \x20                   and Security log size.\n\
+                     \x20 --restore-audit   restore the audit policy and Security log size\n\
+                     \x20                   recorded before Firebreak first changed them.\n\
+                     \x20                   Collected usage data is left untouched.\n\n\
+                     ANALYSIS:\n\
+                     \x20 --no-ui           ingest new events and print a text report to the\n\
+                     \x20                   terminal instead of opening the UI. Never modifies\n\
+                     \x20                   firewall rules.\n\
+                     \x20 --reset           clear collected usage and the ingestion checkpoint;\n\
+                     \x20                   the next run re-scans the whole Security log.\n\
+                     \x20 --db <path>       database path\n\
+                     \x20                   (default %ProgramData%\\firebreak\\firebreak.db)\n\n\
+                     DIAGNOSTICS:\n\
+                     \x20 --dump-filters    dump the live WFP filter table (filter id, name,\n\
+                     \x20                   provider data) for verifying filter->rule mapping.\n\
+                     \x20 --export-support  write a diagnostic bundle to the Desktop: audit\n\
+                     \x20                   state, rules, filters, and an event attribution\n\
+                     \x20                   probe. Review/redact before sharing.\n\
+                     \x20 --ui-preview      open the UI with mock data (no elevation needed).\n\n\
+                     EXAMPLES:\n\
+                     \x20 firebreak --enable-only      start collecting on a server, come back\n\
+                     \x20                              in a few weeks\n\
+                     \x20 firebreak --no-ui            quick text report over what's collected\n\
+                     \x20 firebreak --restore-audit    put the host's audit config back as found\n\n\
+                     Firewall rules are only ever modified from the UI (Apply, with a\n\
+                     restorable policy backup written first) — no CLI option changes rules."
                 );
                 std::process::exit(0);
             }
