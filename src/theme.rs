@@ -25,16 +25,69 @@ fn c(light: (u8, u8, u8), dark: (u8, u8, u8)) -> Color32 {
     Color32::from_rgb(r, g, b)
 }
 
+/// Palette trial switch: FIREBREAK_PALETTE=1..5 picks a candidate accent
+/// family (0/default = current azure). Temporary until a palette is chosen.
+fn palette() -> usize {
+    static P: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *P.get_or_init(|| {
+        std::env::var("FIREBREAK_PALETTE").ok().and_then(|v| v.parse().ok()).filter(|&v| v <= 5).unwrap_or(0)
+    })
+}
+
+/// One color across the 6 palette candidates: [azure, ember, charcoal,
+/// evergreen, ink, copper], each as (light, dark).
+#[inline]
+fn pc(v: [((u8, u8, u8), (u8, u8, u8)); 6]) -> Color32 {
+    let (l, d) = v[palette()];
+    c(l, d)
+}
+
 // ---- semantic palette (light, dark) ----
-pub fn ACCENT() -> Color32 { c((0x29, 0x80, 0xB9), (0x3B, 0x9B, 0xD8)) }
-pub fn ACCENT_TINT() -> Color32 { c((0xEA, 0xF3, 0xFC), (0x1B, 0x2C, 0x3A)) }
-pub fn ACCENT_TINT_BORDER() -> Color32 { c((0xB9, 0xD4, 0xEE), (0x2E, 0x4A, 0x63)) }
-pub fn SELECTED_ROW() -> Color32 { c((0xE7, 0xF0, 0xFA), (0x1D, 0x2B, 0x39)) }
-pub fn DESTRUCTIVE() -> Color32 { c((0xC0, 0x39, 0x2B), (0xD6, 0x4C, 0x44)) }
-pub fn DESTRUCTIVE_DARK() -> Color32 { c((0x92, 0x2B, 0x21), (0xB3, 0x3A, 0x34)) }
+pub fn ACCENT() -> Color32 {
+    pc([
+        ((0x29, 0x80, 0xB9), (0x3B, 0x9B, 0xD8)), // azure (current)
+        ((0xCC, 0x00, 0x00), (0xE8, 0x5D, 0x4F)), // ember — the Gogh red itself
+        ((0x2E, 0x33, 0x38), (0xAA, 0xB6, 0xC0)), // charcoal — red is the only chroma
+        ((0x1F, 0x6E, 0x54), (0x45, 0xAC, 0x86)), // evergreen
+        ((0x35, 0x47, 0x7D), (0x87, 0x9A, 0xDE)), // ink (deep indigo)
+        ((0xA8, 0x62, 0x2A), (0xD2, 0x8D, 0x50)), // copper
+    ])
+}
+pub fn ACCENT_TINT() -> Color32 {
+    pc([
+        ((0xEA, 0xF3, 0xFC), (0x1B, 0x2C, 0x3A)),
+        ((0xFC, 0xE9, 0xE7), (0x3A, 0x1E, 0x1B)),
+        ((0xED, 0xEF, 0xF1), (0x26, 0x2B, 0x30)),
+        ((0xE7, 0xF3, 0xEE), (0x1A, 0x2E, 0x26)),
+        ((0xEA, 0xEE, 0xF8), (0x1F, 0x25, 0x38)),
+        ((0xF8, 0xEF, 0xE6), (0x33, 0x26, 0x1A)),
+    ])
+}
+pub fn ACCENT_TINT_BORDER() -> Color32 {
+    pc([
+        ((0xB9, 0xD4, 0xEE), (0x2E, 0x4A, 0x63)),
+        ((0xF2, 0xC7, 0xC1), (0x5E, 0x2D, 0x27)),
+        ((0xD2, 0xD8, 0xDD), (0x3D, 0x45, 0x4C)),
+        ((0xBF, 0xDE, 0xD2), (0x2D, 0x4C, 0x3F)),
+        ((0xC6, 0xD0, 0xE8), (0x37, 0x41, 0x5E)),
+        ((0xE6, 0xCD, 0xB3), (0x52, 0x3C, 0x28)),
+    ])
+}
+pub fn SELECTED_ROW() -> Color32 {
+    pc([
+        ((0xE7, 0xF0, 0xFA), (0x1D, 0x2B, 0x39)),
+        ((0xFA, 0xE7, 0xE5), (0x38, 0x20, 0x1D)),
+        ((0xEA, 0xED, 0xEF), (0x25, 0x2A, 0x2E)),
+        ((0xE4, 0xF0, 0xEB), (0x19, 0x2C, 0x25)),
+        ((0xE7, 0xEC, 0xF7), (0x1E, 0x24, 0x36)),
+        ((0xF6, 0xED, 0xE3), (0x31, 0x25, 0x19)),
+    ])
+}
+pub fn DESTRUCTIVE() -> Color32 { c((0xCC, 0x00, 0x00), (0xE5, 0x4B, 0x3C)) }
+pub fn DESTRUCTIVE_DARK() -> Color32 { c((0x9E, 0x00, 0x00), (0xC2, 0x3B, 0x2E)) }
 pub fn FAIL_BG() -> Color32 { c((0xFB, 0xEF, 0xED), (0x38, 0x23, 0x21)) }
 pub fn FAIL_BORDER() -> Color32 { c((0xE3, 0xB8, 0xB1), (0x6E, 0x3E, 0x3A)) }
-pub fn BLOCK() -> Color32 { c((0xB0, 0x3A, 0x2E), (0xE0, 0x6B, 0x5E)) }
+pub fn BLOCK() -> Color32 { c((0xB5, 0x15, 0x08), (0xE0, 0x6B, 0x5E)) }
 pub fn LIVE() -> Color32 { c((0x27, 0xAE, 0x60), (0x2E, 0xCC, 0x71)) }
 pub fn LIVE_TEXT() -> Color32 { c((0x1E, 0x84, 0x49), (0x56, 0xD9, 0x8A)) }
 pub fn LIVE_BG() -> Color32 { c((0xEA, 0xF7, 0xEF), (0x14, 0x2E, 0x1E)) }
@@ -60,9 +113,27 @@ pub fn BORDER() -> Color32 { c((0xD5, 0xDC, 0xE2), (0x3B, 0x43, 0x4C)) }
 pub fn BORDER_LIGHT() -> Color32 { c((0xE1, 0xE6, 0xEA), (0x30, 0x37, 0x3E)) }
 pub fn ROW_BORDER() -> Color32 { c((0xEE, 0xF1, 0xF4), (0x2C, 0x33, 0x3A)) }
 pub fn CONTROL_BORDER() -> Color32 { c((0xC3, 0xCC, 0xD3), (0x45, 0x4F, 0x59)) }
-pub fn DARK_SEGMENT() -> Color32 { c((0x34, 0x49, 0x5E), (0x3B, 0x9B, 0xD8)) }
-pub fn HOVER_WASH() -> Color32 { c((0xF5, 0xF8, 0xFB), (0x2E, 0x36, 0x3E)) }
-pub fn LOGO_RED() -> Color32 { Color32::from_rgb(0xC0, 0x39, 0x2B) }
+pub fn DARK_SEGMENT() -> Color32 {
+    pc([
+        ((0x34, 0x49, 0x5E), (0x3B, 0x9B, 0xD8)),
+        ((0x3B, 0x3B, 0x3B), (0xE8, 0x5D, 0x4F)),
+        ((0x2E, 0x33, 0x38), (0x4C, 0x55, 0x5E)),
+        ((0x24, 0x46, 0x3A), (0x45, 0xAC, 0x86)),
+        ((0x2B, 0x3A, 0x66), (0x87, 0x9A, 0xDE)),
+        ((0x6B, 0x44, 0x23), (0xD2, 0x8D, 0x50)),
+    ])
+}
+pub fn HOVER_WASH() -> Color32 {
+    pc([
+        ((0xF5, 0xF8, 0xFB), (0x2E, 0x36, 0x3E)),
+        ((0xFA, 0xF5, 0xF4), (0x34, 0x2E, 0x2D)),
+        ((0xF5, 0xF6, 0xF7), (0x2C, 0x32, 0x37)),
+        ((0xF3, 0xF8, 0xF6), (0x28, 0x31, 0x2D)),
+        ((0xF5, 0xF6, 0xFA), (0x2B, 0x2F, 0x3A)),
+        ((0xFA, 0xF7, 0xF3), (0x33, 0x30, 0x2C)),
+    ])
+}
+pub fn LOGO_RED() -> Color32 { Color32::from_rgb(0xCC, 0x00, 0x00) }
 pub fn ENABLE_GREEN() -> Color32 { c((0x1E, 0x84, 0x49), (0x56, 0xD9, 0x8A)) }
 pub fn BACKUP_BG() -> Color32 { c((0xF0, 0xF8, 0xF2), (0x14, 0x2E, 0x1E)) }
 pub fn BACKUP_BORDER() -> Color32 { c((0xC8, 0xE4, 0xCE), (0x2E, 0x5C, 0x3F)) }
@@ -89,20 +160,22 @@ pub fn CHIP_ANY() -> (&'static str, Color32, Color32, Color32) {
 
 // ---- fonts ----
 
-const SANS: &str = "plex-sans";
-const SANS_MEDIUM: &str = "plex-sans-medium";
-const SANS_SEMIBOLD: &str = "plex-sans-semibold";
-const SANS_ITALIC: &str = "plex-sans-italic";
+const SANS: &str = "alegreya-sans";
+const SANS_MEDIUM: &str = "alegreya-sans-medium";
+const SANS_SEMIBOLD: &str = "alegreya-sans-bold";
+const SANS_ITALIC: &str = "alegreya-sans-italic";
+const SERIF: &str = "alegreya-serif-bold";
 const MONO: &str = "plex-mono";
 const MONO_MEDIUM: &str = "plex-mono-medium";
 
 pub fn install_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
-    let faces: [(&str, &[u8]); 6] = [
-        (SANS, include_bytes!("../assets/fonts/IBMPlexSans-Regular.ttf")),
-        (SANS_MEDIUM, include_bytes!("../assets/fonts/IBMPlexSans-Medium.ttf")),
-        (SANS_SEMIBOLD, include_bytes!("../assets/fonts/IBMPlexSans-SemiBold.ttf")),
-        (SANS_ITALIC, include_bytes!("../assets/fonts/IBMPlexSans-Italic.ttf")),
+    let faces: [(&str, &[u8]); 7] = [
+        (SANS, include_bytes!("../assets/fonts/AlegreyaSans-Regular.ttf")),
+        (SANS_MEDIUM, include_bytes!("../assets/fonts/AlegreyaSans-Medium.ttf")),
+        (SANS_SEMIBOLD, include_bytes!("../assets/fonts/AlegreyaSans-Bold.ttf")),
+        (SANS_ITALIC, include_bytes!("../assets/fonts/AlegreyaSans-Italic.ttf")),
+        (SERIF, include_bytes!("../assets/fonts/Alegreya-Bold.ttf")),
         (MONO, include_bytes!("../assets/fonts/IBMPlexMono-Regular.ttf")),
         (MONO_MEDIUM, include_bytes!("../assets/fonts/IBMPlexMono-Medium.ttf")),
     ];
@@ -116,7 +189,7 @@ pub fn install_fonts(ctx: &egui::Context) {
         .get(&FontFamily::Proportional)
         .cloned()
         .unwrap_or_default();
-    for name in [SANS, SANS_MEDIUM, SANS_SEMIBOLD, SANS_ITALIC, MONO, MONO_MEDIUM] {
+    for name in [SANS, SANS_MEDIUM, SANS_SEMIBOLD, SANS_ITALIC, SERIF, MONO, MONO_MEDIUM] {
         let mut stack = vec![name.to_string()];
         stack.extend(default_stack.iter().cloned());
         fonts.families.insert(FontFamily::Name(name.into()), stack);
@@ -132,6 +205,8 @@ pub fn semibold(size: f32) -> FontId { FontId::new(size, FontFamily::Name(SANS_S
 pub fn italic(size: f32) -> FontId { FontId::new(size, FontFamily::Name(SANS_ITALIC.into())) }
 pub fn mono(size: f32) -> FontId { FontId::new(size, FontFamily::Name(MONO.into())) }
 pub fn mono_medium(size: f32) -> FontId { FontId::new(size, FontFamily::Name(MONO_MEDIUM.into())) }
+/// Alegreya serif — brand face, used only for the app name.
+pub fn serif(size: f32) -> FontId { FontId::new(size, FontFamily::Name(SERIF.into())) }
 
 /// (Re)apply egui visuals for the current mode. Call after set_dark.
 pub fn apply_visuals(ctx: &egui::Context) {

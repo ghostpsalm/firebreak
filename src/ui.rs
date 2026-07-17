@@ -924,11 +924,18 @@ fn image_rgba(png: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
     }
 }
 
+/// Render-scale for screenshot/QA runs: FIREBREAK_PPP=2 renders the whole UI
+/// at 2x pixel density (window physical size scales to match). Default 1.
+pub(crate) fn render_scale() -> f32 {
+    std::env::var("FIREBREAK_PPP").ok().and_then(|v| v.parse().ok()).filter(|p| (0.5..=4.0).contains(p)).unwrap_or(1.0)
+}
+
 fn native_options() -> eframe::NativeOptions {
+    let s = render_scale();
     eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1460.0, 900.0])
-            .with_min_inner_size([1000.0, 620.0])
+            .with_inner_size([1460.0 * s, 900.0 * s])
+            .with_min_inner_size([1000.0 * s, 620.0 * s])
             .with_decorations(false) // custom title bar (see paint::titlebar)
             .with_resizable(true)
             .with_icon(std::sync::Arc::new(app_icon()))
@@ -942,6 +949,7 @@ pub fn run_live(db_path: PathBuf) -> anyhow::Result<()> {
         "firebreak",
         native_options(),
         Box::new(move |cc| {
+            cc.egui_ctx.set_pixels_per_point(render_scale());
             t::apply_style(&cc.egui_ctx);
             Ok(Box::new(App::new_live(db_path, cc.egui_ctx.clone())))
         }),
@@ -959,6 +967,7 @@ pub fn run_preview(
         "firebreak",
         native_options(),
         Box::new(move |cc| {
+            cc.egui_ctx.set_pixels_per_point(render_scale());
             t::apply_style(&cc.egui_ctx);
             Ok(Box::new(App::new_ready(rows, ctx_info, unmatched, listeners)))
         }),
