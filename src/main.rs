@@ -22,6 +22,7 @@ mod theme;
 mod time_util;
 mod ui;
 mod update;
+mod winpriv;
 
 use anyhow::{bail, Result};
 
