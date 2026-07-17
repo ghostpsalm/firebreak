@@ -1,9 +1,10 @@
 //! Self-update via GitHub Releases.
 //!
-//! HTTP goes through PowerShell (like every other subprocess in the app) so we
-//! inherit the OS TLS stack and add no networking crates. The download always
-//! comes from the stable "latest" URL, so a single link persists across
-//! versions; the API is only consulted to learn the newest tag for comparison.
+//! HTTP goes through WinHTTP (see `winhttp.rs`) — no subprocess, OS TLS stack,
+//! no networking crate — with a PowerShell fallback while the WinHTTP path is
+//! still being verified on real hardware. The download always comes from the
+//! stable "latest" URL, so a single link persists across versions; the API is
+//! only consulted to learn the newest tag for comparison.
 
 use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
@@ -33,7 +34,40 @@ pub struct Release {
 
 /// Ask GitHub for the latest release tag and compare it to the running build.
 pub fn check() -> Result<Release> {
+    let tag = latest_tag()?;
+    if tag.is_empty() {
+        return Err(anyhow!("no release published yet"));
+    }
+    let latest = normalize(&tag);
+    let current = crate::pipeline::version_string();
+    let newer = is_newer(&latest, &current);
+    Ok(Release { latest, current, newer })
+}
+
+/// The newest release tag. WinHTTP first (no subprocess); PowerShell fallback.
+#[cfg(windows)]
+fn latest_tag() -> Result<String> {
     let api = format!("https://api.github.com/repos/{REPO}/releases/latest");
+    match crate::winhttp::get(&api, "Accept: application/vnd.github+json") {
+        Ok(body) => {
+            let json: serde_json::Value =
+                serde_json::from_slice(&body).context("parsing releases/latest JSON")?;
+            Ok(json.get("tag_name").and_then(|v| v.as_str()).unwrap_or("").to_string())
+        }
+        Err(e) => {
+            eprintln!("WinHTTP update check failed ({e:#}); falling back to PowerShell");
+            latest_tag_subprocess(&api)
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn latest_tag() -> Result<String> {
+    anyhow::bail!("update checks are only available on Windows")
+}
+
+#[cfg(windows)]
+fn latest_tag_subprocess(api: &str) -> Result<String> {
     let script = format!(
         "$ErrorActionPreference='Stop'; \
          [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; \
@@ -50,14 +84,7 @@ pub fn check() -> Result<Release> {
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    let tag = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if tag.is_empty() {
-        return Err(anyhow!("no release published yet"));
-    }
-    let latest = normalize(&tag);
-    let current = crate::pipeline::version_string();
-    let newer = is_newer(&latest, &current);
-    Ok(Release { latest, current, newer })
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 /// Download the latest asset and swap it in next to the running exe. On success
@@ -70,23 +97,7 @@ pub fn download_and_install() -> Result<PathBuf> {
     let old = dir.join(format!("{ASSET}.old"));
 
     let url = download_url();
-    let script = format!(
-        "$ErrorActionPreference='Stop'; \
-         [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; \
-         Invoke-WebRequest -UseBasicParsing -Uri '{url}' -OutFile '{}'",
-        new.display()
-    );
-    let out = crate::syspath::command(crate::syspath::powershell())
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .output()
-        .context("launching PowerShell for the download")?;
-    if !out.status.success() {
-        let _ = std::fs::remove_file(&new);
-        return Err(anyhow!(
-            "download failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
+    download_to(&url, &new)?;
     let size = std::fs::metadata(&new).map(|m| m.len()).unwrap_or(0);
     if size < 1024 {
         let _ = std::fs::remove_file(&new);
@@ -102,6 +113,40 @@ pub fn download_and_install() -> Result<PathBuf> {
         return Err(anyhow::Error::new(e).context("installing the new exe"));
     }
     Ok(exe)
+}
+
+/// Download `url` to `dest`. WinHTTP first (no subprocess); PowerShell fallback.
+#[cfg(windows)]
+fn download_to(url: &str, dest: &Path) -> Result<()> {
+    match crate::winhttp::get(url, "") {
+        Ok(bytes) => {
+            std::fs::write(dest, &bytes).with_context(|| format!("writing {}", dest.display()))?;
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("WinHTTP download failed ({e:#}); falling back to PowerShell");
+            let script = format!(
+                "$ErrorActionPreference='Stop'; \
+                 [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; \
+                 Invoke-WebRequest -UseBasicParsing -Uri '{url}' -OutFile '{}'",
+                dest.display()
+            );
+            let out = crate::syspath::command(crate::syspath::powershell())
+                .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                .output()
+                .context("launching PowerShell for the download")?;
+            if !out.status.success() {
+                let _ = std::fs::remove_file(dest);
+                return Err(anyhow!("download failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
+            }
+            Ok(())
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn download_to(_url: &str, _dest: &Path) -> Result<()> {
+    anyhow::bail!("downloads are only available on Windows")
 }
 
 /// Relaunch the freshly installed exe and exit this process.
