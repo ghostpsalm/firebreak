@@ -1,6 +1,6 @@
 [package]
 name = "firebreak"
-version = "0.5.9"
+version = "0.6.0"
 edition = "2021"
 description = "On-demand Windows Firewall rule-usage auditor: correlates WFP audit events (5156/5157) with firewall rules to find unused and over-broad rules"
 license-file = "LICENSE"
@@ -21,6 +21,8 @@ egui = "0.29"
 egui_extras = "0.29"
 png = "0.17"
 quick-xml = "0.36"
+# offline collect/review bundles (.zip); deflate only, no extra codecs
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [target.'cfg(windows)'.dependencies]
 rfd = "0.14"

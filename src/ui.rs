@@ -618,6 +618,40 @@ impl App {
         });
     }
 
+    /// Open a firebreak-export bundle (another device's rules + events) as a
+    /// fresh read-only review session.
+    pub(crate) fn spawn_import_bundle(&mut self, path: PathBuf, egui_ctx: egui::Context) {
+        let db = std::env::temp_dir().join(format!("firebreak-import-{}.db", std::process::id()));
+        self.import_db = Some(db.clone());
+        self.phase = Phase::Loading;
+        self.audit_checked = true;
+        self.progress = "Opening bundle…".into();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.worker_rx = Some(rx);
+        std::thread::spawn(move || {
+            let progress = {
+                let tx = tx.clone();
+                let ctx = egui_ctx.clone();
+                move |s: &str| {
+                    let _ = tx.send(WorkerMsg::Progress(s.to_string()));
+                    ctx.request_repaint();
+                }
+            };
+            let msg = match pipeline::import_bundle(&db, &path, true, &progress) {
+                Ok(r) => WorkerMsg::Ready(Box::new(r)),
+                Err(e) => WorkerMsg::Failed(format!("{e:#}")),
+            };
+            let _ = tx.send(msg);
+            egui_ctx.request_repaint();
+        });
+    }
+
+    /// True while reviewing imported data — Apply must stay unavailable
+    /// (the changes would hit THIS host's firewall, not the reviewed one).
+    pub(crate) fn read_only_session(&self) -> bool {
+        self.import_db.is_some()
+    }
+
     /// Turn off Filtering Platform Connection auditing and return to the
     /// first-run (auditing-off) view. Live collection stops.
     fn stop_auditing(&mut self, egui_ctx: &egui::Context) {

@@ -33,6 +33,16 @@ impl Profile {
             Profile::Unknown => "Unknown",
         }
     }
+
+    /// Inverse of label(); NetworkCategory spellings also accepted.
+    pub fn from_label(s: &str) -> Profile {
+        match s.trim() {
+            "Domain" | "DomainAuthenticated" => Profile::Domain,
+            "Private" => Profile::Private,
+            "Public" => Profile::Public,
+            _ => Profile::Unknown,
+        }
+    }
 }
 
 /// IANA protocol numbers as they appear in 5156/5157 events.

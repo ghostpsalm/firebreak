@@ -3,6 +3,7 @@
 mod app_identity;
 mod audit_control;
 mod baseline_checks;
+mod collect;
 mod console;
 mod elevation;
 mod event_query;
@@ -27,6 +28,7 @@ use anyhow::{bail, Result};
 use store::Store;
 
 struct Args {
+    collect: Option<Option<std::path::PathBuf>>,
     enable_only: bool,
     no_ui: bool,
     dump_filters: bool,
@@ -39,6 +41,7 @@ struct Args {
 
 fn parse_args() -> Args {
     let mut args = Args {
+        collect: None,
         enable_only: false,
         no_ui: false,
         dump_filters: false,
@@ -52,6 +55,10 @@ fn parse_args() -> Args {
     while let Some(a) = it.next() {
         match a.as_str() {
             "--enable-only" => args.enable_only = true,
+            "--collect" => {
+                // optional path; default lands on the Desktop
+                args.collect = Some(it.next().filter(|p| !p.starts_with("--")).map(Into::into));
+            }
             "--no-ui" => args.no_ui = true,
             "--dump-filters" => args.dump_filters = true,
             "--export-support" => args.export_support = true,
@@ -76,6 +83,9 @@ fn parse_args() -> Args {
                      ingests new 5156/5157 events and correlates them to firewall rules.\n\
                      All options require elevation except --ui-preview and --help.\n\n\
                      COLLECTION:\n\
+                     \x20 --collect [path]  export an offline audit bundle (rules + network\n\
+                     \x20                   profiles + filtered Security events) as a .zip for\n\
+                     \x20                   review on another machine. Default: the Desktop.\n\
                      \x20 --enable-only     enable connection auditing, snapshot the rule set,\n\
                      \x20                   and exit without opening the UI. Records the prior\n\
                      \x20                   audit state first so --restore-audit can undo it.\n\
@@ -152,6 +162,13 @@ fn main() -> Result<()> {
         support::export(&path)?;
         println!("Support bundle written to:\n  {}", path.display());
         println!("Review/redact if needed, then send it back for diagnosis.");
+        return Ok(());
+    }
+    if let Some(path) = args.collect {
+        let out = path.unwrap_or_else(collect::default_bundle_path);
+        collect::collect(&out, &|s: &str| println!("{s}"))?;
+        println!("Bundle written to:\n  {}", out.display());
+        println!("Open it on your analysis machine: Settings -> Import Firebreak export...");
         return Ok(());
     }
     if args.restore_audit {

@@ -187,14 +187,55 @@ pub fn import_evtx(
         .ok()
         .or_else(firewall_rules::load_rules_cache)
         .context("no firewall rules available to match against")?;
+    let iface_profiles = firewall_rules::interface_profile_map();
+    let name = evtx_path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let host = format!("imported: {name}");
+    let note = format!(
+        "Imported events from {name}, matched against THIS host's rules — export a full \
+         bundle from the target (Settings → Save collection script) for exact results. Read-only."
+    );
+    import_events(scratch_db, evtx_path, rules, iface_profiles, host, note, reset_first, progress)
+}
 
+/// Import a firebreak-export bundle: the target's own rules and interface
+/// profiles ride along, so attribution reflects THAT device, not this one.
+pub fn import_bundle(
+    scratch_db: &Path,
+    zip_path: &Path,
+    reset_first: bool,
+    progress: &dyn Fn(&str),
+) -> Result<AnalysisResult> {
+    progress("Opening bundle…");
+    let b = crate::collect::read_bundle(zip_path)?;
+    let host = format!("{} (imported)", b.manifest.hostname);
+    let note = format!(
+        "Reviewing an export from {} (collected {}). Read-only — apply changes on the \
+         device itself.",
+        b.manifest.hostname,
+        b.manifest.collected_at.get(..10).unwrap_or(&b.manifest.collected_at),
+    );
+    let result = import_events(scratch_db, &b.events_path, b.rules, b.profiles, host, note, reset_first, progress);
+    let _ = std::fs::remove_file(&b.events_path); // temp extraction
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn import_events(
+    scratch_db: &Path,
+    evtx_path: &Path,
+    rules: Vec<crate::model::RuleInfo>,
+    iface_profiles: std::collections::HashMap<u32, crate::scope::Profile>,
+    host_label: String,
+    note: String,
+    reset_first: bool,
+    progress: &dyn Fn(&str),
+) -> Result<AnalysisResult> {
     let store = Store::open(scratch_db)?;
     if reset_first {
         store.reset_ingestion()?;
     }
 
     let scope_index = crate::scope::ScopeIndex::build(&rules);
-    let iface_profiles = firewall_rules::interface_profile_map();
     let device_map = app_identity::device_path_map();
 
     store.begin()?;
@@ -238,20 +279,16 @@ pub fn import_evtx(
     let unmatched = build_unmatched(&store)?;
     // scratch DB is kept for the session so further "Add" imports accumulate
 
-    let name = evtx_path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
     Ok(AnalysisResult {
         rows,
         ctx: ui::AuditContext {
-            hostname: format!("imported: {name}"),
+            hostname: host_label,
             auditing_active: true,
             collection_started: None,
             last_ingest: Some(now_iso()),
             events_processed,
             unmatched_events,
-            note: format!(
-                "Imported {events_processed} events from {name}, matched against THIS host's \
-                 rules. Live listeners don't apply to an import."
-            ),
+            note,
         },
         unmatched,
         listeners: listener_list,

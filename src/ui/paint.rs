@@ -447,6 +447,14 @@ fn settings_menu(app: &mut App, _ui: &mut egui::Ui, ctx: &egui::Context, anchor:
                     app.settings_open = false;
                     do_import_evtx(app, ctx);
                 }
+                if menu_item(ui, "Import Firebreak export…", app.db_path.is_some()) {
+                    app.settings_open = false;
+                    do_import_bundle(app, ctx);
+                }
+                if menu_item(ui, "Save collection script (.ps1)…", true) {
+                    app.settings_open = false;
+                    do_save_collect_script(app);
+                }
                 if menu_item(ui, "Rescan entire log", ready) {
                     if let Some(db) = app.db_path.clone() {
                         let _ = crate::pipeline::reset(&db);
@@ -561,6 +569,49 @@ fn do_import_evtx(app: &mut App, ctx: &egui::Context) {
 #[cfg(not(windows))]
 fn do_import_evtx(app: &mut App, _ctx: &egui::Context) {
     app.status = "Import is only available on Windows.".into();
+}
+
+#[cfg(windows)]
+fn do_import_bundle(app: &mut App, ctx: &egui::Context) {
+    let Some(path) = rfd::FileDialog::new()
+        .add_filter("Firebreak export", &["zip"])
+        .set_title("Import a Firebreak export bundle")
+        .pick_file()
+    else {
+        return;
+    };
+    app.spawn_import_bundle(path, ctx.clone());
+}
+
+#[cfg(not(windows))]
+fn do_import_bundle(app: &mut App, _ctx: &egui::Context) {
+    app.status = "Import is only available on Windows.".into();
+}
+
+/// Write the embedded PowerShell collector to disk for use on hosts that
+/// can't run the exe.
+#[cfg(windows)]
+fn do_save_collect_script(app: &mut App) {
+    let Some(path) = rfd::FileDialog::new()
+        .add_filter("PowerShell script", &["ps1"])
+        .set_file_name("firebreak-collect.ps1")
+        .set_title("Save the offline collection script")
+        .save_file()
+    else {
+        return;
+    };
+    app.status = match std::fs::write(&path, crate::collect::COLLECT_PS1) {
+        Ok(()) => format!(
+            "Saved collection script to {}. Run it elevated on the target device, then import the .zip it produces.",
+            path.display()
+        ),
+        Err(e) => format!("Couldn't save script: {e}"),
+    };
+}
+
+#[cfg(not(windows))]
+fn do_save_collect_script(app: &mut App) {
+    app.status = "Saving the collection script is only available on Windows.".into();
 }
 
 fn menu_item(ui: &mut egui::Ui, label: &str, enabled: bool) -> bool {
@@ -2002,12 +2053,18 @@ fn footer_pending(app: &mut App, ui: &mut egui::Ui, dis: usize, en: usize, scope
             app.revert_all();
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let label = format!("Apply {total} change{}…", if total == 1 { "" } else { "s" });
-            if primary_button(ui, &label, t::ACCENT()).clicked() {
-                app.confirm_open = true;
+            if app.read_only_session() {
+                // reviewing imported data — Apply would hit THIS host, not the
+                // reviewed one, so it's disabled
+                ui.label(egui::RichText::new("Read-only review — apply changes on the device itself.").font(t::italic(11.0)).color(t::SECONDARY()));
+            } else {
+                let label = format!("Apply {total} change{}…", if total == 1 { "" } else { "s" });
+                if primary_button(ui, &label, t::ACCENT()).clicked() {
+                    app.confirm_open = true;
+                }
+                ui.add_space(14.0);
+                ui.label(egui::RichText::new("A restorable policy backup is written before any change.").font(t::italic(11.0)).color(t::SECONDARY()));
             }
-            ui.add_space(14.0);
-            ui.label(egui::RichText::new("A restorable policy backup is written before any change.").font(t::italic(11.0)).color(t::SECONDARY()));
         });
     });
     let _ = ctx;

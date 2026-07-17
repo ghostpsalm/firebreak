@@ -84,6 +84,26 @@ Headless flags (attach to the launching terminal): `--enable-only`, `--no-ui`
 policy + log size to the recorded pre-Firebreak state), `--ui-preview`
 (mock-data UI), `--db <path>`.
 
+## Audit another PC (offline)
+
+Firebreak can review a machine you're not sitting at. On the target device
+(elevated), produce a bundle — rules, network profiles, and the filtered
+Security events, zipped together:
+
+```
+firebreak.exe --collect
+```
+
+Can't run the exe on that box? **Settings → Save collection script (.ps1)…**
+writes a standalone PowerShell collector that produces the same bundle.
+
+Bring the `firebreak-export-<host>-<stamp>.zip` back and open it with
+**Settings → Import Firebreak export…**. It analyses that device's rules
+against its own events — a **read-only** review session (you can't reach out
+and change another machine's firewall, so Apply is disabled). The target must
+have had connection auditing running first (see above), or there'll be no
+events to collect.
+
 ## What you see
 
 Per rule: profile tags (with Domain/Private/Public view filters — default view
