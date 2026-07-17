@@ -216,7 +216,7 @@ fn titlebar(app: &mut App, ctx: &egui::Context) {
             let logo_rect = Rect::from_min_size(Pos2::new(rect.left() + 10.0, rect.center().y - 9.0), Vec2::splat(18.0));
             p.image(logo.id(), logo_rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
             let name_pos = Pos2::new(logo_rect.right() + 8.0, rect.center().y);
-            let name_galley = p.layout_no_wrap("Firebreak".to_string(), t::serif(14.0), t::INK());
+            let name_galley = p.layout_no_wrap("Firebreak".to_string(), t::semibold(12.0), t::INK());
             p.galley(Pos2::new(name_pos.x, name_pos.y - name_galley.size().y / 2.0), name_galley.clone(), t::INK());
             let host = if app.ctx_info.hostname.is_empty() { String::new() } else { format!(" · {}", app.ctx_info.hostname) };
             // catchline sits just after the name (small fixed gap), not floated far right
@@ -233,7 +233,7 @@ fn titlebar(app: &mut App, ctx: &egui::Context) {
                 }
                 let is_close = i == 2;
                 if hovered {
-                    ui.painter().rect_filled(bx, 0.0, if is_close { t::DESTRUCTIVE() } else { Color32::from_rgb(0xDD, 0xE1, 0xE6) });
+                    ui.painter().rect_filled(bx, 0.0, if is_close { t::DESTRUCTIVE() } else { Color32::from_rgb(0xDE, 0xDC, 0xD8) });
                 }
                 let col = if hovered && is_close { Color32::WHITE } else { t::TERTIARY() };
                 let c = bx.center();
@@ -578,7 +578,7 @@ fn about_box(app: &mut App, ctx: &egui::Context) {
         return;
     }
     egui::Area::new(egui::Id::new("about_scrim")).order(egui::Order::Background).show(ctx, |ui| {
-        ui.painter().rect_filled(ctx.screen_rect(), 0.0, Color32::from_rgba_unmultiplied(44, 62, 80, 90));
+        ui.painter().rect_filled(ctx.screen_rect(), 0.0, Color32::from_rgba_unmultiplied(28, 28, 30, 90));
     });
     let mut open = true;
     egui::Window::new("about")
@@ -597,7 +597,7 @@ fn about_box(app: &mut App, ctx: &egui::Context) {
                 ui.painter().image(logo.id(), r, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
                 ui.add_space(8.0);
                 ui.vertical(|ui| {
-                    ui.label(egui::RichText::new("Firebreak").font(t::serif(19.0)).color(t::INK()));
+                    ui.label(egui::RichText::new("Firebreak").font(t::semibold(15.0)).color(t::INK()));
                     ui.label(egui::RichText::new(format!("Version {}", crate::pipeline::version_string())).font(t::mono(11.0)).color(t::SECONDARY()));
                 });
             });
@@ -2040,7 +2040,7 @@ fn confirm_modal(app: &mut App, ctx: &egui::Context) {
     // scrim
     egui::Area::new("scrim".into()).order(egui::Order::Background).show(ctx, |ui| {
         let r = ctx.screen_rect();
-        ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(44, 62, 80, 102));
+        ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(28, 28, 30, 102));
     });
     let mut open = true;
     // list gets up to ~55% of the window height before it scrolls
