@@ -1732,13 +1732,17 @@ fn drawer(app: &mut App, ctx: &egui::Context) {
             let bar = ui.allocate_exact_size(Vec2::new(ui.available_width(), 27.0), Sense::hover()).0;
             ui.painter().hline(bar.x_range(), bar.bottom() - 0.5, Stroke::new(1.0, t::BORDER_LIGHT()));
             let mut x = bar.left();
+            let n_actions = app.applicable_action_count();
             let tabs = [
-                (Tab::Sockets, format!("Active listening sockets  {}", app.listeners.len())),
-                (Tab::Unattributed, format!("Unattributed events  {}", app.unmatched.len())),
+                (Tab::Sockets, format!("Active listening sockets  {}", app.listeners.len()), false),
+                (Tab::Unattributed, format!("Unattributed events  {}", app.unmatched.len()), false),
+                (Tab::Actions, format!("Bonus actions  {n_actions}"), n_actions > 0),
             ];
-            for (tab, label) in tabs {
+            for (tab, label, hot) in tabs {
                 let active = app.drawer_open && app.tab == tab;
-                let g = ui.painter().layout_no_wrap(label.clone(), if active { t::semibold(11.5) } else { t::sans(11.5) }, if active { t::INK() } else { t::SECONDARY() });
+                // the Actions tab carries the flame while it has work to offer
+                let idle_col = if hot { t::ACCENT() } else { t::SECONDARY() };
+                let g = ui.painter().layout_no_wrap(label.clone(), if active { t::semibold(11.5) } else { t::sans(11.5) }, if active { t::INK() } else { idle_col });
                 let w = g.size().x + 28.0;
                 let tab_rect = Rect::from_min_size(Pos2::new(x, bar.top()), Vec2::new(w, 27.0));
                 let hovered = ui.rect_contains_pointer(tab_rect);
@@ -1749,7 +1753,7 @@ fn drawer(app: &mut App, ctx: &egui::Context) {
                     ui.painter().rect_filled(tab_rect, 0.0, t::HOVER_WASH());
                 }
                 ui.painter().vline(tab_rect.right(), tab_rect.y_range(), Stroke::new(1.0, t::BORDER_LIGHT()));
-                ui.painter().galley(tab_rect.center() - g.size() / 2.0, g, if active { t::INK() } else { t::SECONDARY() });
+                ui.painter().galley(tab_rect.center() - g.size() / 2.0, g, if active { t::INK() } else { idle_col });
                 let resp = ui.interact(tab_rect, ui.id().with(("tab", label)), Sense::click());
                 if resp.hovered() {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -1791,9 +1795,80 @@ fn drawer(app: &mut App, ctx: &egui::Context) {
                 ui.allocate_ui(Vec2::new(ui.available_width(), h), |ui| match app.tab {
                     Tab::Sockets => sockets_body(app, ui),
                     Tab::Unattributed => unattributed_body(app, ui),
+                    Tab::Actions => actions_body(app, ui),
                 });
             }
         });
+}
+
+/// Bonus/quick actions: curated bulk operations, phrased as questions. A
+/// stage button edits intended state only — the footer's confirm + backup +
+/// Apply pipeline stays the single path to the firewall.
+fn actions_body(app: &mut App, ui: &mut egui::Ui) {
+    let rect = ui.max_rect();
+    ui.painter().rect_filled(rect, 0.0, t::TABLE_BG());
+    let mut child = ui.child_ui(rect.shrink2(Vec2::new(0.0, 4.0)), egui::Layout::top_down(egui::Align::Min), None);
+    egui::ScrollArea::vertical().auto_shrink([false; 2]).show(&mut child, |ui| {
+        let mut stage: Option<usize> = None;
+        for (i, a) in crate::ui::actions_catalog().iter().enumerate() {
+            let pending = app.action_pending(a);
+            let n = pending.len();
+            let row_h = 58.0;
+            let (rr, _) = ui.allocate_exact_size(Vec2::new(rect.width(), row_h), Sense::hover());
+            let p = ui.painter();
+            let evidence_gated = a.needs_evidence && !app.ctx_info.auditing_active;
+
+            // title + explanation (wrapped to leave room for the control)
+            let text_w = (rr.width() - PAGE * 2.0 - 190.0).max(200.0);
+            let title_col = if n > 0 { t::INK() } else { t::DISABLED() };
+            p.text(Pos2::new(rr.left() + PAGE, rr.top() + 14.0), Align2::LEFT_CENTER, a.title, t::semibold(12.0), title_col);
+            let explain = p.layout(a.explain.to_string(), t::sans(10.5), if n > 0 { t::SECONDARY() } else { t::DISABLED() }, text_w);
+            p.galley(Pos2::new(rr.left() + PAGE, rr.top() + 26.0), explain, t::SECONDARY());
+
+            // right-side control: count + stage button (or status text)
+            let bx = rr.right() - PAGE - 160.0;
+            if evidence_gated {
+                p.text(Pos2::new(bx, rr.center().y), Align2::LEFT_CENTER, "needs auditing evidence", t::italic(11.0), t::DISABLED());
+            } else if n == 0 {
+                p.text(Pos2::new(bx, rr.center().y), Align2::LEFT_CENTER, "nothing to change", t::italic(11.0), t::DISABLED());
+            } else {
+                let label = match a.effect {
+                    crate::ui::ActionEffect::Disable => format!("Stage: disable {n} rule{}", if n == 1 { "" } else { "s" }),
+                    crate::ui::ActionEffect::RemovePublic => format!("Stage: edit {n} rule{}", if n == 1 { "" } else { "s" }),
+                };
+                let g = ui.painter().layout_no_wrap(label.clone(), t::sans(11.5), t::ACCENT());
+                let brect = Rect::from_min_size(
+                    Pos2::new(rr.right() - PAGE - g.size().x - 20.0, rr.center().y - 12.0),
+                    Vec2::new(g.size().x + 20.0, 24.0),
+                );
+                let bresp = ui.interact(brect, ui.id().with(("act", i)), Sense::click());
+                let (fill, border, txt) = if bresp.hovered() {
+                    (t::ACCENT(), t::ACCENT(), t::TABLE_BG())
+                } else {
+                    (t::ACCENT_TINT(), t::ACCENT_TINT_BORDER(), t::ACCENT())
+                };
+                ui.painter().rect(brect, 0.0, fill, Stroke::new(1.0, border));
+                ui.painter().galley(brect.center() - g.size() / 2.0, ui.painter().layout_no_wrap(label, t::sans(11.5), txt), txt);
+                if bresp.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    bresp.clone().on_hover_text("Stages the change into the checkboxes/chips — nothing is applied until you review and click Apply (a policy backup is always written first).");
+                }
+                if bresp.clicked() {
+                    stage = Some(i);
+                }
+            }
+            ui.painter().hline(rr.x_range(), rr.bottom() - 0.5, Stroke::new(1.0, t::ROW_BORDER()));
+        }
+        if let Some(i) = stage {
+            let a = &crate::ui::actions_catalog()[i];
+            app.stage_action(a);
+        }
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.add_space(PAGE);
+            ui.label(egui::RichText::new("Staging only edits intent — review the pending footer, then Apply. Revert all undoes staged changes.").font(t::italic(10.5)).color(t::TERTIARY()));
+        });
+    });
 }
 
 fn sockets_body(app: &App, ui: &mut egui::Ui) {

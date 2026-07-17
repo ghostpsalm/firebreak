@@ -169,6 +169,145 @@ enum Phase {
 enum Tab {
     Sockets,
     Unattributed,
+    Actions,
+}
+
+// ---- bonus / quick actions ----
+// Curated bulk operations phrased as plain-English questions. Staging an
+// action only edits the intended state (checkboxes / profile chips); the
+// changes then ride the normal confirm + backup + Apply pipeline — an
+// action can never touch the firewall directly.
+
+pub(crate) enum ActionEffect {
+    /// untick the enable checkbox on matching rules
+    Disable,
+    /// remove the Public profile from matching rules (only when another
+    /// profile remains, so the rule never ends up profile-less)
+    RemovePublic,
+}
+
+pub(crate) struct QuickAction {
+    pub title: &'static str,
+    pub explain: &'static str,
+    pub effect: ActionEffect,
+    pub matcher: fn(&RuleRow) -> bool,
+    /// needs usage evidence — gated off while auditing is inactive
+    pub needs_evidence: bool,
+}
+
+fn contains_ci(hay: &str, needle: &str) -> bool {
+    hay.to_lowercase().contains(needle)
+}
+
+fn rule_text_match(r: &RuleRow, needle: &str) -> bool {
+    contains_ci(&r.rule.display_name, needle)
+        || r.rule.group.as_deref().map_or(false, |g| contains_ci(g, needle))
+}
+
+fn udp_port(r: &RuleRow, port: &str) -> bool {
+    r.rule.protocol.as_deref().map_or(false, |p| p.eq_ignore_ascii_case("udp"))
+        && r.rule.local_port.as_deref().map_or(false, |lp| lp.split(',').any(|p| p == port))
+}
+
+fn inbound_allow(r: &RuleRow) -> bool {
+    r.rule.direction.eq_ignore_ascii_case("inbound") && r.rule.action.eq_ignore_ascii_case("allow")
+}
+
+pub(crate) fn actions_catalog() -> &'static [QuickAction] {
+    &[
+        QuickAction {
+            title: "Disable inbound allow rules with zero observed hits?",
+            explain: "The core cleanup: enabled inbound allow rules that no traffic has matched \
+                      in the entire collection window. Only trustworthy once collection has \
+                      covered weekly/monthly activity — check \"Collecting since\" in the header.",
+            effect: ActionEffect::Disable,
+            matcher: |r| inbound_allow(r) && r.total_hits() == 0,
+            needs_evidence: true,
+        },
+        QuickAction {
+            title: "Not using mDNS device discovery?",
+            explain: "mDNS (UDP 5353) lets apps discover printers, Chromecasts and speakers on \
+                      the local network. On servers and locked-down desktops it's usually \
+                      unneeded inbound exposure.",
+            effect: ActionEffect::Disable,
+            matcher: |r| rule_text_match(r, "mdns") || udp_port(r, "5353"),
+            needs_evidence: false,
+        },
+        QuickAction {
+            title: "Not using UPnP / SSDP discovery?",
+            explain: "SSDP (UDP 1900) advertises and discovers UPnP devices — media servers, \
+                      smart TVs, routers. Rarely needed on managed machines.",
+            effect: ActionEffect::Disable,
+            matcher: |r| rule_text_match(r, "ssdp") || udp_port(r, "1900"),
+            needs_evidence: false,
+        },
+        QuickAction {
+            title: "Not using LLMNR name resolution?",
+            explain: "LLMNR (UDP 5355) is a legacy fallback when DNS fails — and a classic \
+                      credential-theft vector (responder attacks). Disable unless you rely on \
+                      name resolution without DNS.",
+            effect: ActionEffect::Disable,
+            matcher: |r| rule_text_match(r, "llmnr") || udp_port(r, "5355"),
+            needs_evidence: false,
+        },
+        QuickAction {
+            title: "Not using Windows Remote Assistance?",
+            explain: "Remote Assistance rules admit unsolicited help sessions. If your remote \
+                      support runs through other tooling, these are dormant inbound doors.",
+            effect: ActionEffect::Disable,
+            matcher: |r| rule_text_match(r, "remote assistance"),
+            needs_evidence: false,
+        },
+        QuickAction {
+            title: "Stop file & printer sharing on Public networks?",
+            explain: "Removes the Public profile from File and Printer Sharing rules, so shares \
+                      stop being reachable on untrusted networks while Domain/Private keep \
+                      working. Rules whose only profile is Public are left alone.",
+            effect: ActionEffect::RemovePublic,
+            matcher: |r| rule_text_match(r, "file and printer sharing"),
+            needs_evidence: false,
+        },
+    ]
+}
+
+impl App {
+    /// Rows the action would still change (already-staged rows drop out).
+    pub(crate) fn action_pending(&self, a: &QuickAction) -> Vec<usize> {
+        if a.needs_evidence && !self.ctx_info.auditing_active {
+            return Vec::new();
+        }
+        (0..self.rows.len())
+            .filter(|&i| {
+                let r = &self.rows[i];
+                if !r.rule.is_enabled() || !(a.matcher)(r) {
+                    return false;
+                }
+                match a.effect {
+                    ActionEffect::Disable => r.target_enabled,
+                    ActionEffect::RemovePublic => {
+                        r.target_profiles.public
+                            && (r.target_profiles.domain || r.target_profiles.private)
+                    }
+                }
+            })
+            .collect()
+    }
+
+    /// Stage the action into intended state; Apply remains a separate,
+    /// confirmed, backup-first step.
+    pub(crate) fn stage_action(&mut self, a: &QuickAction) {
+        for i in self.action_pending(a) {
+            match a.effect {
+                ActionEffect::Disable => self.rows[i].target_enabled = false,
+                ActionEffect::RemovePublic => self.rows[i].target_profiles.public = false,
+            }
+        }
+    }
+
+    /// How many catalog actions currently have something to stage.
+    pub(crate) fn applicable_action_count(&self) -> usize {
+        actions_catalog().iter().filter(|a| !self.action_pending(a).is_empty()).count()
+    }
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -520,6 +659,11 @@ impl App {
             }
             Ok("modal") => app.confirm_open = true,
             Ok("settings") => app.settings_open = true,
+            Ok("actions") => {
+                app.drawer_open = true;
+                app.tab = Tab::Actions;
+                app.drawer_height = 300.0;
+            }
             Ok("about") => app.about_open = true,
             Ok("update") => {
                 app.about_open = true;
