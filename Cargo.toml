@@ -42,7 +42,12 @@ features = [
     "Win32_UI_WindowsAndMessaging",
 ]
 
+# Speed-first: the hot paths (Security-log XML parsing, SQLite ingest) and UI
+# frame times matter more than a few MB on disk. fat LTO + single codegen unit
+# give whole-program optimization; abort-on-panic drops unwinding tables.
 [profile.release]
-opt-level = "z"
-lto = true
+opt-level = 3
+lto = "fat"
+codegen-units = 1
 strip = true
+panic = "abort"
